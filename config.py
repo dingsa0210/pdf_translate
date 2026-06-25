@@ -5,6 +5,12 @@
 import os
 import json
 
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass  # python-dotenv 未安装时回退到纯环境变量
+
 # ============================================================
 # LLM 翻译配置 (OpenAI 兼容接口)
 # ============================================================
