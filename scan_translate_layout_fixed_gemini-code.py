@@ -488,100 +488,33 @@ def _detect_table_lines(img_gray):
 
 
 def _detect_all_table_cells(h_lines, v_lines, hmask, vmask, img_gray, ocr_items=None):
-    """单元格优先检测：扫描全图找出所有表格单元格（不依赖OCR块，无位置偏见）。
+    """单元格优先检测：对每个OCR项运行_find_table_cell，去重后返回所有格。
 
-    v2.1: 可选传入 ocr_items，过滤仅保留含OCR文本的格（排除CAD中线形成的假格）。
+    v2.3: 放弃全局线枚举（CAD中线与表格线交错导致漏检），
+          改为对每个OCR块执行目标搜索，再合并去重。
 
-    返回: [(left, top, right, bottom), ...] 按自上而下、自左而右排列。
-
-    判别策略（针对CAD图纸）：
-      1. 矩形闭合验证：水平和竖线必须形成闭合四边形
-      2. 相邻格一致性：孤立格排除，至少有一边与另一个格共享边界
-      3. 白底验证：格内大面积白色（>CELL_WHITE_THRESHOLD）
-      4. 尺寸约束：CELL_MIN_W/H ~ CELL_MAX_W/H
-      5. OCR内容验证：至少有一个OCR块与该格重叠>30%（排除CAD中线假格）
+    返回: [(left, top, right, bottom), ...]
     """
-    h_img, w_img = img_gray.shape
-    
-    # 过滤表格级线（邻居密度判定）
-    hy_sorted = sorted(h_lines, key=lambda x: x[0])
-    h_gaps = np.diff([y for y, _, _ in hy_sorted]) if len(hy_sorted) > 1 else np.array([])
-    h_table = set()
-    for idx, (y, _, _) in enumerate(hy_sorted):
-        nbr = 0
-        if idx > 0 and idx - 1 < len(h_gaps) and h_gaps[idx - 1] <= 250:
-            nbr += 1
-        if idx < len(h_gaps) and h_gaps[idx] <= 250:
-            nbr += 1
-        if idx > 1 and idx - 2 < len(h_gaps) and h_gaps[idx - 2] + h_gaps[idx - 1] <= 250:
-            nbr += 1
-        if nbr >= 2:
-            h_table.add(y)
-    tbl_h = sorted([h for h in h_lines if h[0] in h_table], key=lambda x: x[0])
+    if not ocr_items:
+        logger.info("  [格网检测] 无OCR项，跳过格网检测")
+        return [], [], []
 
-    vx_sorted = sorted(v_lines, key=lambda x: x[0])
-    v_gaps = np.diff([x for x, _, _ in vx_sorted]) if len(vx_sorted) > 1 else np.array([])
-    v_table = set()
-    for idx, (x, _, _) in enumerate(vx_sorted):
-        nbr = 0
-        if idx > 0 and idx - 1 < len(v_gaps) and v_gaps[idx - 1] <= 350:
-            nbr += 1
-        if idx < len(v_gaps) and v_gaps[idx] <= 350:
-            nbr += 1
-        if idx > 1 and idx - 2 < len(v_gaps) and v_gaps[idx - 2] + v_gaps[idx - 1] <= 350:
-            nbr += 1
-        if nbr >= 1:
-            v_table.add(x)
-    tbl_v = sorted([v for v in v_lines if v[0] in v_table], key=lambda x: x[0])
+    logger.info(f"  [格网检测] 对{len(ocr_items)}个OCR项执行目标格搜索...")
 
-    if len(tbl_h) < 2 or len(tbl_v) < 2:
-        logger.warning(f"  [格网检测] 表格线不足: h线{len(tbl_h)}条 v线{len(tbl_v)}条 (至少各需2条)，跳过格网检测")
-        return [], tbl_h, tbl_v
+    cells_set = set()  # 用 set 自动去重
+    found_count = 0
+    for idx, item in enumerate(ocr_items):
+        cell = _find_table_cell(item["bbox"], h_lines, v_lines, hmask, vmask, img_gray, margin=50)
+        if cell is not None:
+            # 放宽margin重试
+            cl, ct, cr, cb = cell
+            # 微调: 用_register_text_in_cell中的逻辑检查重叠
+            cells_set.add(cell)
+            found_count += 1
 
-    logger.info(f"  [格网检测] 过滤后表格线: h线{len(tbl_h)}条 v线{len(tbl_v)}条, 开始枚举候选格...")
+    cells = sorted(cells_set, key=lambda c: (c[1], c[0]))
 
-    # v2.0: 仅枚举相邻线对（单元格最小化），而非所有线对
-    # 四层嵌套变为二层：相邻水平线对 × 相邻竖线对
-    cells = []
-    skipped_size = 0
-    skipped_closure = 0
-    skipped_white = 0
-    for hi in range(len(tbl_h) - 1):
-        yt, _, _ = tbl_h[hi]
-        yb, _, _ = tbl_h[hi + 1]
-        ch = yb - yt
-        if ch < CELL_MIN_H or ch > CELL_MAX_H:
-            skipped_size += 1
-            logger.debug(f"    [跳过-尺寸] ({tbl_v[0][0] if tbl_v else '?'},{yt})-({tbl_v[-1][0] if tbl_v else '?'},{yb}) h={ch}px (范围{CELL_MIN_H}~{CELL_MAX_H})")
-            continue
-        for vi in range(len(tbl_v) - 1):
-            xl, _, _ = tbl_v[vi]
-            xr, _, _ = tbl_v[vi + 1]
-            cw = xr - xl
-            if cw < CELL_MIN_W or cw > CELL_MAX_W:
-                skipped_size += 1
-                continue
-            # 矩形闭合验证：四条线在格四角必须分别连通（hmask/vmask交叉）
-            if not (_line_crosses_region(hmask, yt, xl, xr) and
-                    _line_crosses_region(hmask, yb, xl, xr) and
-                    _line_crosses_region(vmask, xl, yt, yb) and
-                    _line_crosses_region(vmask, xr, yt, yb)):
-                skipped_closure += 1
-                logger.debug(f"    [跳过-非闭合] ({xl},{yt})-({xr},{yb}) {cw}x{ch}px 四边不闭合")
-                continue
-            # 白底验证
-            if yt + 2 < yb - 2 and xl + 2 < xr - 2:
-                roi = img_gray[yt + 2:yb - 2, xl + 2:xr - 2]
-                if roi.size == 0 or float(np.mean(roi > 180)) < CELL_WHITE_THRESHOLD:
-                    white_ratio = float(np.mean(roi > 180)) if roi.size > 0 else 0
-                    skipped_white += 1
-                    logger.debug(f"    [跳过-非白底] ({xl},{yt})-({xr},{yb}) {cw}x{ch}px 白底率={white_ratio:.1%} < {CELL_WHITE_THRESHOLD:.0%}")
-                    continue
-            cells.append((xl, yt, xr, yb))
-
-    logger.info(f"  [格网检测] 候选格: 通过{cells}个 | 尺寸不符{skipped_size} | 非闭合{skipped_closure} | 非白底{skipped_white}")
-
-    # 相邻格一致性过滤：孤立的单个格（与任何其他格都不共享边界）排除
+    # 相邻格一致性过滤
     if len(cells) > 1:
         filtered = []
         isolated = []
@@ -590,11 +523,10 @@ def _detect_all_table_cells(h_lines, v_lines, hmask, vmask, img_gray, ocr_items=
             for j, (nl, nt, nr, nb) in enumerate(cells):
                 if i == j:
                     continue
-                # 共享上/下边界（横坐标有重叠且纵坐标恰好对接）或 共享左/右边界
-                if (abs(ct - nb) <= 3 or abs(cb - nt) <= 3) and (max(cl, nl) < min(cr, nr)):
+                if (abs(ct - nb) <= 5 or abs(cb - nt) <= 5) and (max(cl, nl) < min(cr, nr)):
                     has_neighbor = True
                     break
-                if (abs(cr - nl) <= 3 or abs(cl - nr) <= 3) and (max(ct, nt) < min(cb, nb)):
+                if (abs(cr - nl) <= 5 or abs(cl - nr) <= 5) and (max(ct, nt) < min(cb, nb)):
                     has_neighbor = True
                     break
             if has_neighbor or len(cells) <= 3:
@@ -603,40 +535,17 @@ def _detect_all_table_cells(h_lines, v_lines, hmask, vmask, img_gray, ocr_items=
                 isolated.append((cl, ct, cr, cb))
         if isolated:
             for iso in isolated:
-                logger.info(f"  [格网检测] 排除孤立格 ({iso[0]},{iso[1]})-({iso[2]},{iso[3]}) 无相邻格")
+                logger.info(f"  [格网检测] 排除孤立格 ({iso[0]},{iso[1]})-({iso[2]},{iso[3]})")
         cells = filtered
 
-    cells.sort(key=lambda c: (c[1], c[0]))  # 自上而下，自左而右
-    
-    # v2.1: OCR内容验证——仅保留至少包含一个OCR文本的格（排除CAD中线假格）
-    if ocr_items and cells:
-        text_cells = []
-        for cell in cells:
-            cl, ct, cr, cb = cell
-            for item in ocr_items:
-                x1, y1, x2, y2 = item["bbox"]
-                ox1, oy1 = max(x1, cl), max(y1, ct)
-                ox2, oy2 = min(x2, cr), min(y2, cb)
-                if ox2 > ox1 and oy2 > oy1:
-                    overlap = (ox2 - ox1) * (oy2 - oy1)
-                    item_area = (x2 - x1) * (y2 - y1)
-                    if item_area > 0 and overlap > item_area * 0.30:
-                        text_cells.append(cell)
-                        break
-        excluded = len(cells) - len(text_cells)
-        if excluded > 0:
-            logger.info(f"  [格网检测] OCR内容过滤: 排除 {excluded} 个无文本假格 (CAD中线)")
-        cells = text_cells
-
-    # 为最终保留的格分配唯一编号（必须在滤镜之后，避免CAD假格污染注册表）
     for cell in cells:
         _cell_id(cell)
 
-    logger.info(f"  [格网检测] 最终确认 {len(cells)} 个单元格 (h线{len(tbl_h)}条, v线{len(tbl_v)}条)")
+    logger.info(f"  [格网检测] 最终确认 {len(cells)} 个单元格 (从{found_count}次命中去重)")
     for cell in cells:
         cid = _cell_registry[cell]
         logger.info(f"    {cid}: ({cell[0]},{cell[1]})-({cell[2]},{cell[3]}) {cell[2]-cell[0]}x{cell[3]-cell[1]}px")
-    return cells, tbl_h, tbl_v
+    return cells, [], []
 
 
 def _line_crosses_region(mask, coord, r1, r2):
