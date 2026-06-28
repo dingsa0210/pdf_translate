@@ -35,6 +35,11 @@ CHUNK_SIZE = int(os.environ.get("CHUNK_SIZE", "4000"))
 FONT_PATH = os.environ.get("FONT_PATH", r"C:\Windows\Fonts\arial.ttf")
 
 # ============================================================
+# 单元格检测引擎: "opencv_v3" (纯OpenCV) | "ppstructure" (PaddleOCR表格识别)
+# ============================================================
+CELL_DETECT_ENGINE = os.environ.get("CELL_DETECT_ENGINE", "opencv_v3")
+
+# ============================================================
 # 工程术语字典 (从外部 JSON 文件加载)
 # ============================================================
 _dict_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "engineering_dict.json")

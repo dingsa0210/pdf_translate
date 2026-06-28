@@ -2,10 +2,16 @@
 扫描型PDF中文→英文翻译 - RapidOCR + 分块OCR + 智能行合并排版优化版
 流程: 扫描PDF→渲染→分块OCR→单元格优先检测→智能文本行合并→隔离标签翻译→白底擦除→绝对左对齐回填→重构PDF
 
-v2.0 优化（按扫描PDF图纸处理规则）:
-  - 单元格优先检测：先找格网，再分配OCR块，处理同格多box
+v3.1 优化（按扫描PDF图纸处理规则）:
+  - 单元格优先检测：三阶段级联（轮廓矩形→线交叉网格→文本间隙推理）+ 回退
+  - 多尺度线段检测（Canny + HoughP）：支持≥30px短线段，替代旧版≥200px长线过滤
+  - 线交叉网格交点过滤：仅保留≥3交点线（排除CAD结构线），候选格数从O(H²×V²)→可控
+  - CAD线 vs 表格线甄别：基于邻格一致性过滤孤立假格 + 文本邻近过滤
+  - 文本间隙推理区域约束：仅在已检测表格密集区运行，避免全图假格
+  - 文本邻近后过滤：移除不含OCR文本且远离文本的假格
   - 单元格最小化擦除，2px内缩保护格线
   - 增强CAD线 vs 表格线判别（矩形闭合验证、相邻格一致性）
+  - _find_table_cell回退margin缩小至30px（原50px），减少跨格误匹配
   - 修复_fit_text_to_box回退高度造假 → 文本重叠
   - 修复_wrap_structured_text长单词不折行 → 宽度溢出
   - 单元格内按内容比例分配行高，硬裁剪防溢出
@@ -25,6 +31,7 @@ from loguru import logger
 from config import (
     LLM_API_BASE, LLM_API_KEY, LLM_MODEL, LLM_BATCH_SIZE, LLM_TEMPERATURE,
     TRANSLATE_ENGINE, ENGINEERING_DICT, RENDER_DPI, CHUNK_SIZE, FONT_PATH,
+    CELL_DETECT_ENGINE,
 )
 
 PDF_PATH = r"d:\AIGC\projects\pdf_translate\pdfs\20260523-Rolling Mill Foundation Plan GZL24.7-17.8基础平面图-V2.0_1.pdf"
@@ -45,6 +52,7 @@ CELL_MAX_W = int(os.environ.get("CELL_MAX_W", "1200"))
 CELL_MAX_H = int(os.environ.get("CELL_MAX_H", "400"))  # 放宽到400px，容纳多行单元格（如"借（通）用\n件登记"）
 CELL_ERASE_INSET = int(os.environ.get("CELL_ERASE_INSET", "2"))  # 格内擦除缩进，保护格线
 CELL_WHITE_THRESHOLD = float(os.environ.get("CELL_WHITE_THRESHOLD", "0.80"))  # 格内白底比例
+# CELL_DETECT_ENGINE 已从 config.py 导入，通过 .env 文件配置
 
 # ---- loguru 日志配置 ----
 LOG_DIR = os.path.join(WORK_DIR, "logs")
@@ -460,212 +468,960 @@ def _group_coords(coords, gap=4):
     return out
 
 
-def _detect_table_lines(img_gray):
-    """全图检测长直线，返回 (h_lines, v_lines, hmask, vmask)。
+# ═══════════════════════════════════════════════════════════════
+# v3.0 单元格检测核心（深度优化 OpenCV 方案）
+# 策略级联：轮廓矩形检测 → 线交叉网格 → 文本间隙推理 → 旧版回退
+# ═══════════════════════════════════════════════════════════════
 
-    h_lines/v_lines: [(坐标, 起点, 终点), ...]
-    hmask/vmask: bool 掩码
+# ---- 新增检测常量 ----
+HOUGH_THRESH = int(os.environ.get("HOUGH_THRESH", "40"))        # Hough线检测投票阈值
+HOUGH_MIN_LEN = int(os.environ.get("HOUGH_MIN_LEN", "30"))       # 最小线段长（远小于原来的200px）
+HOUGH_MAX_GAP = int(os.environ.get("HOUGH_MAX_GAP", "8"))        # 线段断裂容忍
+GRID_INTERSECT_DENSITY = int(os.environ.get("GRID_INTERSECT_DENSITY", "3"))  # 表格线至少与N条垂直线相交
+CAD_LINE_MAX_INTERSECT = int(os.environ.get("CAD_LINE_MAX_INTERSECT", "2"))  # CAD线最多与N条线相交
+
+
+def _detect_all_line_segments(img_gray):
+    """多尺度线检测：Canny边缘 + 概率Hough变换 → 全尺度线段（≥30px）。
+
+    替代原来的单一形态学长线检测（≥200px），现可检测任意长度线段。
+    返回: (h_segs, v_segs) 水平/竖直线段 [(x1,y1,x2,y2), ...]
     """
     h_img, w_img = img_gray.shape
+
+    # 1. 自适应二值化（比OTSU对CAD图纸更友好）
+    bw = cv2.adaptiveThreshold(img_gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                cv2.THRESH_BINARY_INV, 31, 8)
+
+    # 2. Canny边缘检测
+    edges = cv2.Canny(bw, 50, 150, apertureSize=3)
+
+    # 3. 概率Hough线段检测
+    lines = cv2.HoughLinesP(edges, 1, np.pi / 180, HOUGH_THRESH,
+                             minLineLength=HOUGH_MIN_LEN, maxLineGap=HOUGH_MAX_GAP)
+
+    h_segs, v_segs = [], []
+    if lines is None:
+        logger.info(f"  [线段检测] HoughP → 0条线段")
+        return h_segs, v_segs
+
+    for line in lines:
+        x1, y1, x2, y2 = line[0]
+        dx, dy = abs(x2 - x1), abs(y2 - y1)
+        angle = float(np.degrees(np.arctan2(dy, dx))) if dx > 0 else 90.0
+
+        if angle < 15:  # 近水平（±15°）
+            h_segs.append(tuple(map(int, (x1, y1, x2, y2))))
+        elif angle > 75:  # 近竖直（±15°）
+            v_segs.append(tuple(map(int, (x1, y1, x2, y2))))
+        # 中间角度的线丢弃（CAD图纸斜线非格网）
+
+    logger.info(f"  [线段检测] HoughP → {len(h_segs)} 水平段 + {len(v_segs)} 竖直线段 "
+                f"(minLen={HOUGH_MIN_LEN}px)")
+    return h_segs, v_segs
+
+
+def _detect_rectangular_contours(img_gray):
+    """轮廓检测：找二值图中闭合矩形轮廓 → 直接单元格候选。
+
+    CAD图纸中完整的表格单元格是封闭矩形，轮廓检测可精确捕获。
+    返回: [(left, top, right, bottom), ...] 闭合矩形候选格列表
+    """
+    h_img, w_img = img_gray.shape
+
+    # 自适应二值化
+    bw = cv2.adaptiveThreshold(img_gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                cv2.THRESH_BINARY_INV, 31, 8)
+
+    # 形态学闭运算：连接小断裂
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+    closed = cv2.morphologyEx(bw, cv2.MORPH_CLOSE, kernel, iterations=1)
+
+    # 查找外轮廓
+    contours, _ = cv2.findContours(closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    cells = []
+    for cnt in contours:
+        x, y, w_rect, h_rect = cv2.boundingRect(cnt)
+        # 尺寸过滤
+        if not (CELL_MIN_W <= w_rect <= CELL_MAX_W and CELL_MIN_H <= h_rect <= CELL_MAX_H):
+            continue
+
+        # 矩形度验证：轮廓面积 vs 外接矩形面积
+        area = cv2.contourArea(cnt)
+        rect_area = w_rect * h_rect
+        if rect_area == 0:
+            continue
+        rectangularity = area / rect_area
+        if rectangularity < 0.75:  # 至少75%填充率才算矩形
+            continue
+
+        # 白底验证
+        roi = img_gray[y + 2:y + h_rect - 2, x + 2:x + w_rect - 2] if h_rect > 4 and w_rect > 4 else None
+        if roi is None or roi.size == 0:
+            continue
+        if float(np.mean(roi > 180)) < CELL_WHITE_THRESHOLD:
+            continue
+
+        cells.append((x, y, x + w_rect, y + h_rect))
+
+    logger.info(f"  [轮廓检测] 找到 {len(cells)} 个闭合矩形候选格")
+    return cells
+
+
+def _build_line_intersection_grid(h_segs, v_segs, img_gray):
+    """线交叉网格：从水平/竖直线段集合构建候选单元格。
+
+    v3.1: 激进预过滤 — 只保留含≥3个垂直线交点的线（排除CAD结构线）。
+    算法：
+      1. 计算每条线的交点数量（交点=附近的垂直线段）
+      2. 过滤掉<3交点的线（CAD结构线特征）
+      3. 用剩余线生成候选格
+
+    返回: [(left, top, right, bottom), ...]
+    """
+    if len(h_segs) < 2 or len(v_segs) < 2:
+        return []
+
+    h_img, w_img = img_gray.shape
+    INTERSECT_WINDOW = 100  # 交点搜索窗口（px）
+    MIN_INTERSECTIONS = 3   # 表格线至少与3条垂直线相交
+
+    # 归一化线段为坐标
+    def _normalize(segs, is_horizontal, gap=8):
+        coords = {}
+        for (x1, y1, x2, y2) in segs:
+            key = (y1 + y2) // 2 if is_horizontal else (x1 + x2) // 2
+            rng = (min(x1, x2), max(x1, x2)) if is_horizontal else (min(y1, y2), max(y1, y2))
+            if key not in coords:
+                coords[key] = []
+            coords[key].append(rng)
+        merged = {}
+        keys = sorted(coords.keys())
+        for k in keys:
+            merged_k = k
+            for mk in sorted(merged.keys()):
+                if abs(k - mk) <= gap:
+                    merged_k = mk
+                    break
+            if merged_k not in merged:
+                merged[merged_k] = []
+            merged[merged_k].extend(coords[k])
+        return {mk: merged[mk] for mk in sorted(merged.keys())}
+
+    h_merged = _normalize(h_segs, is_horizontal=True, gap=6)
+    v_merged = _normalize(v_segs, is_horizontal=False, gap=6)
+
+    # 计算每条横线与竖线的交点数量
+    def _count_intersections(line_ys, other_coords, window=INTERSECT_WINDOW):
+        """对每条横线y，统计在window范围内的竖线数量"""
+        counts = {}
+        for y in line_ys:
+            cnt = sum(1 for x in other_coords if abs(x - y) <= window or True)
+            # 对横线：竖线穿过它 = 竖线的y范围包含横向y
+            cnt = 0
+            for x, ranges in other_coords.items():
+                for (r1, r2) in ranges:
+                    if r1 <= y <= r2:
+                        cnt += 1
+                        break
+            counts[y] = cnt
+        return counts
+
+    h_intersect_counts = {}
+    for y in h_merged:
+        cnt = 0
+        for x, ranges in v_merged.items():
+            for (r1, r2) in ranges:
+                if r1 - INTERSECT_WINDOW <= y <= r2 + INTERSECT_WINDOW:
+                    cnt += 1
+                    break
+        h_intersect_counts[y] = cnt
+
+    v_intersect_counts = {}
+    for x in v_merged:
+        cnt = 0
+        for y, ranges in h_merged.items():
+            for (r1, r2) in ranges:
+                if r1 - INTERSECT_WINDOW <= x <= r2 + INTERSECT_WINDOW:
+                    cnt += 1
+                    break
+        v_intersect_counts[x] = cnt
+
+    # 过滤：只保留≥MIN_INTERSECTIONS交点的"表格线"
+    h_filtered = [y for y, c in h_intersect_counts.items() if c >= MIN_INTERSECTIONS]
+    v_filtered = [x for x, c in v_intersect_counts.items() if c >= MIN_INTERSECTIONS]
+
+    logger.info(f"  [线交叉网格] 交点过滤: {len(h_merged)}→{len(h_filtered)}条水平线, "
+                f"{len(v_merged)}→{len(v_filtered)}条竖直线 (需≥{MIN_INTERSECTIONS}交点)")
+
+    if len(h_filtered) < 2 or len(v_filtered) < 2:
+        return []
+
+    # 生成候选格（仅用过滤后的线）
+    cells = []
+    for i in range(len(h_filtered) - 1):
+        for j in range(len(v_filtered) - 1):
+            top, bot = h_filtered[i], h_filtered[i + 1]
+            lft, rgt = v_filtered[j], v_filtered[j + 1]
+            cw, ch = rgt - lft, bot - top
+            if not (CELL_MIN_W <= cw <= CELL_MAX_W and CELL_MIN_H <= ch <= CELL_MAX_H):
+                continue
+
+            # 验证角点
+            corners_ok = 0
+            check_margin = 8
+            corners = [
+                (top, lft), (top, rgt), (bot, lft)
+            ]
+            for cy_c, cx_c in corners:
+                y1p = max(0, int(cy_c) - check_margin)
+                y2p = min(h_img, int(cy_c) + check_margin)
+                x1p = max(0, int(cx_c) - check_margin)
+                x2p = min(w_img, int(cx_c) + check_margin)
+                if y2p > y1p and x2p > x1p:
+                    patch = img_gray[y1p:y2p, x1p:x2p]
+                    if patch.size > 0 and np.any(patch < 128):
+                        corners_ok += 1
+
+            if corners_ok < 2:
+                continue
+
+            # 白底验证
+            roi = img_gray[top + 2:bot - 2, lft + 2:rgt - 2] if bot - top > 4 and rgt - lft > 4 else None
+            if roi is None or roi.size == 0:
+                continue
+            if float(np.mean(roi > 180)) < CELL_WHITE_THRESHOLD:
+                continue
+
+            cells.append((lft, top, rgt, bot))
+
+    logger.info(f"  [线交叉网格] 生成 {len(cells)} 个候选格")
+    return cells
+
+
+def _classify_grid_region(cells, img_gray):
+    """表格区域甄别：过滤可能是CAD结构线形成的假格。
+
+    判定逻辑:
+      1. 真正的表格通常有多个相邻单元格（形成网格）
+      2. 相邻格尺寸高度一致（同一行）或宽度一致（同一列）
+      3. 孤立格（无同行/同列邻居）且尺寸不规则的 → CAD假格
+
+    返回: 过滤后的格列表
+    """
+    if len(cells) <= 1:
+        return cells
+
+    validated = []
+    for i, (cl, ct, cr, cb) in enumerate(cells):
+        cw, ch = cr - cl, cb - ct
+        has_row_neighbor = False
+        has_col_neighbor = False
+        row_size_match = 0
+        col_size_match = 0
+
+        for j, (nl, nt, nr, nb) in enumerate(cells):
+            if i == j:
+                continue
+            nw, nh = nr - nl, nb - nt
+
+            # 同行邻居：顶部对齐±8px 且水平相邻
+            if abs(ct - nt) <= 8 and abs(cb - nb) <= 8:
+                if abs(cr - nl) <= 10 or abs(cl - nr) <= 10:
+                    has_row_neighbor = True
+                    if abs(ch - nh) <= 6:
+                        row_size_match += 1
+
+            # 同列邻居：左侧对齐±8px 且垂直相邻
+            if abs(cl - nl) <= 8 and abs(cr - nr) <= 8:
+                if abs(cb - nt) <= 10 or abs(ct - nb) <= 10:
+                    has_col_neighbor = True
+                    if abs(cw - nw) <= 6:
+                        col_size_match += 1
+
+        # 判定：有行/列邻居 + 尺寸一致的 → 真实表格格
+        if (has_row_neighbor and row_size_match >= 1) or (has_col_neighbor and col_size_match >= 1):
+            validated.append((cl, ct, cr, cb))
+        elif has_row_neighbor or has_col_neighbor:
+            validated.append((cl, ct, cr, cb))
+        else:
+            logger.debug(f"  [CAD过滤] 排除孤立假格 ({cl},{ct})-({cr},{cb}) {cw}×{ch}px")
+
+    removed = len(cells) - len(validated)
+    if removed > 0:
+        logger.info(f"  [CAD过滤] 排除 {removed} 个孤立假格")
+    return validated
+
+
+def _find_cells_by_text_gaps(ocr_items, img_gray, existing_cells=None):
+    """v3.1 文本间隙推理：仅在已有表格格附近区域使用OCR文本反推单元格边界。
+
+    限制：只处理被>=2个已有单元格覆盖的"表格密集区"，
+          避免在全图非表格区域制造假格。
+
+    返回: [(left, top, right, bottom), ...]
+    """
+    if len(ocr_items) < 4:  # 至少4个OCR项才可能存在表格
+        return []
+
+    h_img, w_img = img_gray.shape
+
+    # 如果有已有格，仅在其邻域内搜索
+    if existing_cells and len(existing_cells) >= 3:
+        # 计算表格密集区 = 已检测格的包围盒
+        all_cl = min(c[0] for c in existing_cells)
+        all_ct = min(c[1] for c in existing_cells)
+        all_cr = max(c[2] for c in existing_cells)
+        all_cb = max(c[3] for c in existing_cells)
+        # 扩展20%缓冲
+        bw = int((all_cr - all_cl) * 0.2)
+        bh = int((all_cb - all_ct) * 0.2)
+        region = (max(0, all_cl - bw), max(0, all_ct - bh),
+                  min(w_img, all_cr + bw), min(h_img, all_cb + bh))
+        logger.info(f"  [文本间隙] 限定区域: ({region[0]},{region[1]})-({region[2]},{region[3]})")
+    else:
+        # 没有已有格 → 很可能没有表格 → 不运行
+        return []
+
+    # 收集区域内的OCR坐标
+    rl, rt, rr, rb = region
+    lefts, rights, tops, bots = [], [], [], []
+    for item in ocr_items:
+        x1, y1, x2, y2 = item["bbox"]
+        if x1 >= rl - 10 and x2 <= rr + 10 and y1 >= rt - 10 and y2 <= rb + 10:
+            lefts.append(x1)
+            rights.append(x2)
+            tops.append(y1)
+            bots.append(y2)
+
+    if len(lefts) < 4:
+        return []
+
+    def _cluster_coords(coords, tolerance=20):
+        if not coords:
+            return []
+        sorted_c = sorted(coords)
+        clusters = []
+        current = [sorted_c[0]]
+        for c in sorted_c[1:]:
+            if c - current[-1] <= tolerance:
+                current.append(c)
+            else:
+                clusters.append(int(np.median(current)))
+                current = [c]
+        clusters.append(int(np.median(current)))
+        return clusters
+
+    left_clusters = _cluster_coords(lefts, tolerance=25)
+    right_clusters = _cluster_coords(rights, tolerance=25)
+    top_clusters = _cluster_coords(tops, tolerance=20)
+    bot_clusters = _cluster_coords(bots, tolerance=20)
+
+    if len(left_clusters) < 2 or len(top_clusters) < 2:
+        return []
+
+    col_edges = sorted(set(left_clusters + right_clusters))
+    row_edges = sorted(set(top_clusters + bot_clusters))
+
+    cells = []
+    if len(col_edges) >= 2 and len(row_edges) >= 2:
+        for yi in range(len(row_edges) - 1):
+            for xi in range(len(col_edges) - 1):
+                cl2, cr2 = col_edges[xi], col_edges[xi + 1]
+                ct2, cb2 = row_edges[yi], row_edges[yi + 1]
+                cw, ch = cr2 - cl2, cb2 - ct2
+                if not (CELL_MIN_W <= cw <= CELL_MAX_W and CELL_MIN_H <= ch <= CELL_MAX_H):
+                    continue
+                # 区域边界检查
+                if cl2 < rl - 10 or cr2 > rr + 10 or ct2 < rt - 10 or cb2 > rb + 10:
+                    continue
+                roi = img_gray[ct2 + 2:cb2 - 2, cl2 + 2:cr2 - 2] if ch > 4 and cw > 4 else None
+                if roi is None or roi.size == 0:
+                    continue
+                if float(np.mean(roi > 180)) < CELL_WHITE_THRESHOLD:
+                    continue
+                cells.append((cl2, ct2, cr2, cb2))
+
+    logger.info(f"  [文本间隙] 区域内聚类:{len(left_clusters)}L/{len(top_clusters)}T → {len(cells)}个候选格")
+    return cells
+
+
+def _remove_contained_cells(cells):
+    """移除被其他格完全包含的嵌套格。"""
+    if len(cells) <= 1:
+        return cells
+    keep = []
+    for i, (cl, ct, cr, cb) in enumerate(cells):
+        contained = False
+        for j, (nl, nt, nr, nb) in enumerate(cells):
+            if i == j:
+                continue
+            if nl <= cl and nt <= ct and nr >= cr and nb >= cb:
+                if (nr - nl) * (nb - nt) > (cr - cl) * (cb - ct):
+                    contained = True
+                    logger.debug(f"  [去重] 移除被包含格 ({cl},{ct})-({cr},{cb}) "
+                                 f"被 ({nl},{nt})-({nr},{nb}) 包含")
+                    break
+        if not contained:
+            keep.append((cl, ct, cr, cb))
+    return keep
+
+
+def _detect_table_lines(img_gray):
+    """v3.0: 保留旧版接口兼容性，但内部使用新的多尺度线段检测。
+
+    返回: (h_lines, v_lines, hmask, vmask)
+    注: h_segs/v_segs 额外作为全局变量传递（通过闭包替代方案）
+    """
+    h_img, w_img = img_gray.shape
+    # 保留旧版形态学掩码（供 _find_table_cell 回退使用）
     bw = cv2.threshold(img_gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)[1]
     h_len = max(30, 120)
     hmask = cv2.morphologyEx(bw, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (h_len, 1))) > 0
     v_len = max(30, 120)
     vmask = cv2.morphologyEx(bw, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (1, v_len))) > 0
-    h_cand = _group_coords(np.where(np.sum(hmask, axis=1) > 5)[0])
-    v_cand = _group_coords(np.where(np.sum(vmask, axis=0) > 5)[0])
+
+    # v3.0 新增：多尺度线段检测（替代旧的 >200px 长线过滤）
+    h_segs, _v_segs = _detect_all_line_segments(img_gray)
+    # 将线段转换为旧版 h_lines/v_lines 格式：[(坐标, 起点, 终点), ...]
     h_out = []
-    for y in h_cand:
-        dark_cols = np.where(hmask[y])[0]
-        if len(dark_cols) and (dark_cols[-1] - dark_cols[0]) > 200:
-            h_out.append((int(y), int(dark_cols[0]), int(dark_cols[-1])))
+    h_coord_map = {}
+    for (x1, y1, x2, y2) in h_segs:
+        y = (y1 + y2) // 2
+        if y not in h_coord_map:
+            h_coord_map[y] = []
+        h_coord_map[y].extend([x1, x2])
+    for y in sorted(h_coord_map.keys()):
+        xs = h_coord_map[y]
+        h_out.append((int(y), int(min(xs)), int(max(xs))))
+
     v_out = []
-    for x in v_cand:
-        dark_rows = np.where(vmask[:, x])[0]
-        if len(dark_rows) and (dark_rows[-1] - dark_rows[0]) > 200:
-            v_out.append((int(x), int(dark_rows[0]), int(dark_rows[-1])))
+    v_coord_map = {}
+    for (x1, y1, x2, y2) in _v_segs:
+        x = (x1 + x2) // 2
+        if x not in v_coord_map:
+            v_coord_map[x] = []
+        v_coord_map[x].extend([y1, y2])
+    for x in sorted(v_coord_map.keys()):
+        ys = v_coord_map[x]
+        v_out.append((int(x), int(min(ys)), int(max(ys))))
+
     return h_out, v_out, hmask, vmask
 
 
-def _detect_all_table_cells(h_lines, v_lines, hmask, vmask, img_gray, ocr_items=None):
-    """单元格优先检测：对每个OCR项运行_find_table_cell，去重后返回所有格。
+# 全图线段缓存（v3.0 新增，供 _detect_all_table_cells_v3 使用）
+_global_h_segs = []
+_global_v_segs = []
 
-    v2.3: 放弃全局线枚举（CAD中线与表格线交错导致漏检），
-          改为对每个OCR块执行目标搜索，再合并去重。
+
+# ═══════════════════════════════════════════════════════════════
+# PP-Structure 引擎（PaddleOCR 表格识别）
+# ═══════════════════════════════════════════════════════════════
+
+# 全局缓存的 PaddleOCR 实例（惰性初始化，仅导入一次）
+_ppocr_instance = None
+_ppocr_available = None  # None=未检测, True=可用, False=不可用
+
+
+def _get_ppocr():
+    """惰性初始化 PaddleOCR 实例（PP-Structure 表格识别引擎）。
+
+    首次调用时导入 paddleocr，最多等待 120 秒；超时或失败则标记为不可用。
+    注意：PaddlePaddle 在 CPU-only 环境下导入可能需要 5+ 分钟，本函数默认超时 120s。
+         如需调整超时，设置环境变量 PPOCR_IMPORT_TIMEOUT（秒）。
+
+    返回: PaddleOCR 实例 或 None（不可用时）
+    """
+    global _ppocr_instance, _ppocr_available
+    if _ppocr_available is False:
+        return None
+    if _ppocr_instance is not None:
+        return _ppocr_instance
+
+    import_timeout = int(os.environ.get("PPOCR_IMPORT_TIMEOUT", "120"))
+    try:
+        import time as _time
+        import sys as _sys
+        import threading as _threading
+
+        _t0 = _time.time()
+        logger.info(f"  [PP-Structure] 首次加载 PaddleOCR 引擎（超时={import_timeout}s）...")
+
+        # 在后台线程中导入，主线程等待超时
+        result = {"ocr": None, "error": None, "done": False}
+
+        def _import_ppocr():
+            try:
+                from paddleocr import PaddleOCR
+                result["ocr"] = PaddleOCR(
+                    use_doc_parser=False,
+                    lang='ch',
+                    use_gpu=False,
+                )
+            except Exception as e:
+                result["error"] = str(e)
+            finally:
+                result["done"] = True
+
+        thread = _threading.Thread(target=_import_ppocr, daemon=True)
+        thread.start()
+        thread.join(timeout=import_timeout)
+
+        if not result["done"]:
+            _ppocr_available = False
+            logger.warning(f"  [PP-Structure] PaddleOCR 导入超时 ({import_timeout}s)。"
+                           f"CPU-only 环境建议使用 opencv_v3 引擎。"
+                           f"可设置 PPOCR_IMPORT_TIMEOUT=600 延长等待。")
+            return None
+
+        if result["error"]:
+            _ppocr_available = False
+            logger.warning(f"  [PP-Structure] PaddleOCR 导入失败: {result['error']}")
+            return None
+
+        _ppocr_instance = result["ocr"]
+        _ppocr_available = True
+        logger.info(f"  [PP-Structure] PaddleOCR 引擎就绪 (耗时 {_time.time() - _t0:.1f}s)")
+        return _ppocr_instance
+
+    except Exception as e:
+        _ppocr_available = False
+        logger.warning(f"  [PP-Structure] PaddleOCR 引擎不可用: {e}")
+        return None
+
+
+def _detect_all_table_cells_ppstructure(h_lines, v_lines, hmask, vmask,
+                                         img_gray, img_bgr, ocr_items=None):
+    """PP-Structure 表格单元格检测：使用 PaddleOCR 内置的表格识别引擎。
+
+    流程：
+      1. 用 PaddleOCR 对全图做 table recognition
+      2. 解析返回的 HTML/JSON 中的 cell 坐标
+      3. 将 cell 坐标注入 _cell_registry
+
+    返回: [(left, top, right, bottom), ...], [], []
+    """
+    ocr = _get_ppocr()
+    if ocr is None:
+        logger.warning("  [PP-Structure] 引擎不可用，回退到 OpenCV v3")
+        return _detect_all_table_cells_opencv(
+            h_lines, v_lines, hmask, vmask, img_gray, ocr_items=ocr_items)
+
+    logger.info("  [PP-Structure] 执行 PaddleOCR 表格识别...")
+    try:
+        # PaddleOCR 3.x API: recognize_table 或 predict
+        # 保存临时图像供 PaddleOCR 读取
+        import tempfile
+        import cv2 as _cv2
+        import os as _os
+
+        tmp_path = _os.path.join(
+            _os.path.dirname(_os.path.abspath(__file__)) if '__file__' in dir() else _os.getcwd(),
+            'scan_work', '_ppstructure_input.png')
+        _cv2.imwrite(tmp_path, img_bgr)
+
+        # 使用 PaddleOCR 3.x 的 predict 方法
+        result = ocr.predict(tmp_path, table=True)
+
+        # 尝试清理临时文件
+        try:
+            _os.remove(tmp_path)
+        except Exception:
+            pass
+
+        # 解析 PaddleOCR 返回结果
+        cells = _parse_paddleocr_table_result(result, img_gray)
+        logger.info(f"  [PP-Structure] 解析到 {len(cells)} 个单元格")
+
+        # 如果 PP-Structure 结果太少（<3个格），回退到 OpenCV
+        if len(cells) < 3:
+            logger.warning(f"  [PP-Structure] 检测到的单元格太少({len(cells)}个)，回退到 OpenCV v3")
+            return _detect_all_table_cells_opencv(
+                h_lines, v_lines, hmask, vmask, img_gray, ocr_items=ocr_items)
+
+        # 注册单元格
+        for cell in cells:
+            _cell_id(cell)
+
+        logger.info(f"  [PP-Structure检测汇总] 最终确认 {len(cells)} 个单元格")
+        for cell in cells:
+            cid = _cell_registry[cell]
+            logger.info(f"    {cid}: ({cell[0]},{cell[1]})-({cell[2]},{cell[3]}) "
+                        f"{cell[2]-cell[0]}x{cell[3]-cell[1]}px")
+
+        return cells, [], []
+
+    except Exception as e:
+        logger.warning(f"  [PP-Structure] 表格识别失败: {e}，回退到 OpenCV v3")
+        import traceback
+        logger.debug(traceback.format_exc())
+        return _detect_all_table_cells_opencv(
+            h_lines, v_lines, hmask, vmask, img_gray, ocr_items=ocr_items)
+
+
+def _parse_paddleocr_table_result(result, img_gray):
+    """从 PaddleOCR 3.x 的表格识别结果中提取单元格坐标。
+
+    PaddleOCR 3.x 返回格式（list of dict）:
+      [{
+        'input_path': '...',
+        'table_res': {
+          'cell_boxes': [[x1,y1,x2,y2], ...],  # 单元格坐标
+          'html': '<table>...</table>',
+        }
+      }]
 
     返回: [(left, top, right, bottom), ...]
     """
-    if not ocr_items:
-        logger.info("  [格网检测] 无OCR项，跳过格网检测")
-        return [], [], []
+    cells = []
+    h_img, w_img = img_gray.shape
 
-    logger.info(f"  [格网检测] 对{len(ocr_items)}个OCR项执行目标格搜索...")
+    if not result or not isinstance(result, list):
+        return cells
 
-    cells_set = set()  # 用 set 自动去重
-    found_count = 0
-    for idx, item in enumerate(ocr_items):
-        cell = _find_table_cell(item["bbox"], h_lines, v_lines, hmask, vmask, img_gray, margin=50)
-        if cell is not None:
-            # 放宽margin重试
-            cl, ct, cr, cb = cell
-            # 微调: 用_register_text_in_cell中的逻辑检查重叠
-            cells_set.add(cell)
-            found_count += 1
+    for res_item in result:
+        if not isinstance(res_item, dict):
+            continue
 
+        # 尝试多种可能的 key 名
+        table_res = res_item.get('table_res') or res_item.get('tables') or {}
+        if isinstance(table_res, list):
+            # 多个表格的情况
+            for tbl in table_res:
+                if isinstance(tbl, dict):
+                    cell_boxes = tbl.get('cell_boxes', [])
+                    cells.extend(_validate_and_filter_cells(cell_boxes, img_gray))
+        elif isinstance(table_res, dict):
+            cell_boxes = table_res.get('cell_boxes', [])
+            cells.extend(_validate_and_filter_cells(cell_boxes, img_gray))
+
+        # 尝试从 'res' 字段获取
+        res = res_item.get('res', {})
+        if isinstance(res, dict):
+            cell_boxes = res.get('cell_boxes', [])
+            cells.extend(_validate_and_filter_cells(cell_boxes, img_gray))
+
+    return cells
+
+
+def _validate_and_filter_cells(cell_boxes, img_gray):
+    """验证和过滤 PaddleOCR 返回的单元格坐标。"""
+    cells = []
+    if not cell_boxes:
+        return cells
+
+    h_img, w_img = img_gray.shape
+
+    for box in cell_boxes:
+        if len(box) < 4:
+            continue
+        x1, y1, x2, y2 = map(int, box[:4])
+        # 确保坐标顺序正确
+        if x1 > x2:
+            x1, x2 = x2, x1
+        if y1 > y2:
+            y1, y2 = y2, y1
+
+        cw, ch = x2 - x1, y2 - y1
+        if not (CELL_MIN_W <= cw <= CELL_MAX_W and CELL_MIN_H <= ch <= CELL_MAX_H):
+            continue
+
+        # 白底验证
+        roi = img_gray[y1 + 2:y2 - 2, x1 + 2:x2 - 2] if ch > 4 and cw > 4 else None
+        if roi is None or roi.size == 0:
+            continue
+        if float(np.mean(roi > 180)) < CELL_WHITE_THRESHOLD:
+            continue
+
+        cells.append((x1, y1, x2, y2))
+
+    return cells
+
+
+# ═══════════════════════════════════════════════════════════════
+# 单元格检测调度器（引擎切换入口）
+# ═══════════════════════════════════════════════════════════════
+
+def _detect_all_table_cells_dispatch(h_lines, v_lines, hmask, vmask,
+                                      img_gray, img_bgr=None, ocr_items=None):
+    """根据 CELL_DETECT_ENGINE 环境变量调度单元格检测引擎。
+
+    "opencv_v3"  → 纯 OpenCV 多策略检测 (v3.1)
+    "ppstructure" → PaddleOCR PP-Structure 表格识别（不可用时自动回退）
+
+    返回: [(left, top, right, bottom), ...], [], []
+    """
+    engine = CELL_DETECT_ENGINE.lower()
+    logger.info(f"  [调度] 单元格检测引擎: {engine}")
+
+    if engine == "ppstructure":
+        if img_bgr is None:
+            logger.warning("  [调度] PP-Structure 需要 BGR 图像，回退到 OpenCV v3")
+            return _detect_all_table_cells_opencv(
+                h_lines, v_lines, hmask, vmask, img_gray, ocr_items=ocr_items)
+        return _detect_all_table_cells_ppstructure(
+            h_lines, v_lines, hmask, vmask, img_gray, img_bgr, ocr_items=ocr_items)
+    else:
+        # 默认: opencv_v3
+        return _detect_all_table_cells_opencv(
+            h_lines, v_lines, hmask, vmask, img_gray, ocr_items=ocr_items)
+
+
+def _detect_all_table_cells_opencv(h_lines, v_lines, hmask, vmask, img_gray, ocr_items=None):
+    """OpenCV v3.1 多策略单元格检测级联（带约束）：
+    阶段A: 轮廓矩形检测 — 精确捕获闭合单元格
+    阶段B: 线交叉网格 — 仅用≥3交点的线构建候选格（排除CAD线）
+    阶段C: 文本间隙推理 — 仅在A+B已有格的区域运行
+    阶段D: 回退 — 对未覆盖的OCR项，调用 _find_table_cell
+    后过滤: 移除不含OCR文本的孤立格
+    """
+    cells_set = set()
+
+    # === 阶段A: 轮廓矩形检测 ===
+    contour_cells = _detect_rectangular_contours(img_gray)
+    for c in contour_cells:
+        cells_set.add(c)
+    logger.info(f"  [阶段A] 轮廓检测: {len(contour_cells)} 个闭合矩形格")
+
+    # === 阶段B: 线交叉网格（v3.1: 交点过滤） ===
+    h_segs, v_segs = _detect_all_line_segments(img_gray)
+    _global_h_segs[:] = h_segs
+    _global_v_segs[:] = v_segs
+
+    grid_cells = _build_line_intersection_grid(h_segs, v_segs, img_gray)
+    for c in grid_cells:
+        cells_set.add(c)
+    logger.info(f"  [阶段B] 线交叉网格: {len(grid_cells)} 个候选格")
+
+    # === 阶段C: 文本间隙推理（v3.1: 仅在A+B表格密集区运行） ===
+    if ocr_items:
+        existing_before_c = list(cells_set)
+        gap_cells = _find_cells_by_text_gaps(ocr_items, img_gray, existing_cells=existing_before_c)
+        for c in gap_cells:
+            cells_set.add(c)
+        logger.info(f"  [阶段C] 文本间隙推理: {len(gap_cells)} 个候选格")
+    else:
+        gap_cells = []
+        logger.info(f"  [阶段C] 无OCR项，跳过文本间隙推理")
+
+    # === 阶段D: 回退 _find_table_cell（覆盖前三个阶段遗漏的OCR文本） ===
+    fallback_count = 0
+    if ocr_items:
+        for idx, item in enumerate(ocr_items):
+            bx1, by1, bx2, by2 = item["bbox"]
+            covered = any(
+                cl <= bx1 and ct <= by1 and cr >= bx2 and cb >= by2
+                for (cl, ct, cr, cb) in cells_set
+            )
+            if covered:
+                continue
+            cell = _find_table_cell(item["bbox"], h_lines, v_lines, hmask, vmask, img_gray, margin=30)
+            if cell is not None:
+                cells_set.add(cell)
+                fallback_count += 1
+        if fallback_count:
+            logger.info(f"  [阶段D] 回退 _find_table_cell: {fallback_count} 个补充格")
+
+    # === 后处理 ===
     cells = sorted(cells_set, key=lambda c: (c[1], c[0]))
-
-    # 相邻格一致性过滤
-    if len(cells) > 1:
-        filtered = []
-        isolated = []
-        for i, (cl, ct, cr, cb) in enumerate(cells):
-            has_neighbor = False
-            for j, (nl, nt, nr, nb) in enumerate(cells):
-                if i == j:
-                    continue
-                if (abs(ct - nb) <= 5 or abs(cb - nt) <= 5) and (max(cl, nl) < min(cr, nr)):
-                    has_neighbor = True
-                    break
-                if (abs(cr - nl) <= 5 or abs(cl - nr) <= 5) and (max(ct, nt) < min(cb, nb)):
-                    has_neighbor = True
-                    break
-            if has_neighbor or len(cells) <= 3:
-                filtered.append((cl, ct, cr, cb))
-            else:
-                isolated.append((cl, ct, cr, cb))
-        if isolated:
-            for iso in isolated:
-                logger.info(f"  [格网检测] 排除孤立格 ({iso[0]},{iso[1]})-({iso[2]},{iso[3]})")
-        cells = filtered
+    cells = _remove_contained_cells(cells)
+    if ocr_items:
+        cells = _filter_cells_by_text_proximity(cells, ocr_items)
+    cells = _classify_grid_region(cells, img_gray)
 
     for cell in cells:
         _cell_id(cell)
 
-    logger.info(f"  [格网检测] 最终确认 {len(cells)} 个单元格 (从{found_count}次命中去重)")
+    logger.info(f"  [检测汇总] 最终确认 {len(cells)} 个单元格 "
+                f"(轮廓{len(contour_cells)}+网格{len(grid_cells)}+间隙{len(gap_cells)}+回退{fallback_count})")
     for cell in cells:
         cid = _cell_registry[cell]
         logger.info(f"    {cid}: ({cell[0]},{cell[1]})-({cell[2]},{cell[3]}) {cell[2]-cell[0]}x{cell[3]-cell[1]}px")
     return cells, [], []
 
 
-def _line_crosses_region(mask, coord, r1, r2):
-    """验证线条在区域 [r1, r2] 内是否有像素存在。"""
-    h, w = mask.shape
-    r1, r2 = max(0, int(r1)), min(w - 1, int(r2))
-    if r2 <= r1:
+def _detect_all_table_cells_v3(h_lines, v_lines, hmask, vmask, img_gray, ocr_items=None):
+    """v3.1 向后兼容包装：默认走 OpenCV 引擎。
+    可通过设置环境变量 CELL_DETECT_ENGINE=ppstructure 切换到 PP-Structure。
+    """
+    return _detect_all_table_cells_opencv(h_lines, v_lines, hmask, vmask, img_gray, ocr_items=ocr_items)
+
+
+
+def _filter_cells_by_text_proximity(cells, ocr_items, max_gap=50):
+    """v3.1 文本邻近过滤：移除不含OCR文本且离最近文本>max_gap的孤立格。
+
+    这类格通常是CAD图纸中的空白装饰框、结构线交叉形成的假矩形等。
+    """
+    if not ocr_items:
+        return cells
+
+    ocr_bboxes = [(it["bbox"][0], it["bbox"][1], it["bbox"][2], it["bbox"][3]) for it in ocr_items]
+
+    def _cell_contains_text(cl, ct, cr, cb):
+        """格内是否包含OCR文本"""
+        for ox1, oy1, ox2, oy2 in ocr_bboxes:
+            # OCR中心在格内
+            ocx, ocy = (ox1 + ox2) // 2, (oy1 + oy2) // 2
+            if cl <= ocx <= cr and ct <= ocy <= cb:
+                return True
+            # 或OCR框与格>50%重叠
+            ol = max(cl, ox1)
+            ot = max(ct, oy1)
+            or_ = min(cr, ox2)
+            ob = min(cb, oy2)
+            if ol < or_ and ot < ob:
+                overlap = (or_ - ol) * (ob - ot)
+                ocr_area = (ox2 - ox1) * (oy2 - oy1)
+                if ocr_area > 0 and overlap > ocr_area * 0.3:
+                    return True
         return False
-    if coord < 0 or coord >= h:
-        return False
-    return bool(np.any(mask[int(coord), r1:r2 + 1]))
+
+    def _nearest_text_dist(cl, ct, cr, cb):
+        """格中心到最近OCR中心的距离"""
+        cx, cy = (cl + cr) // 2, (ct + cb) // 2
+        min_d = float('inf')
+        for ox1, oy1, ox2, oy2 in ocr_bboxes:
+            ocx, ocy = (ox1 + ox2) // 2, (oy1 + oy2) // 2
+            d = np.hypot(cx - ocx, cy - ocy)
+            if d < min_d:
+                min_d = d
+        return min_d
+
+    keep = []
+    removed = 0
+    for cl, ct, cr, cb in cells:
+        if _cell_contains_text(cl, ct, cr, cb):
+            keep.append((cl, ct, cr, cb))
+        elif _nearest_text_dist(cl, ct, cr, cb) <= max_gap:
+            keep.append((cl, ct, cr, cb))
+        else:
+            removed += 1
+            logger.debug(f"  [文本过滤] 移除无文本格 ({cl},{ct})-({cr},{cb})")
+
+    if removed:
+        logger.info(f"  [文本过滤] 移除 {removed} 个远离OCR文本的孤立格")
+    return keep
 
 
-def _find_table_cell(bbox, h_lines, v_lines, hmask, vmask, img_gray, margin=50):
-    """用已检测出的表格线，求出包围 bbox 的单元格四边。
+def _find_table_cell(bbox, h_lines, v_lines, hmask, vmask, img_gray, margin=30):
+    """v3.0 回退方案：用检测出的表格线围绕 bbox 中心点定位单元格。
 
-    通过 hmask/vmask 精确判断每条候选线在 text bbox 区域内是否真实存在，
-    杜绝右下标题栏的线被误用到左下表格（即使线跨全图长，中间如果被空白截断也通不过）。
-
-    v2.2: 如果标准搜索失败，自动扩大margin重试；仍失败则用图像边界兜底。
+    优化点：默认margin缩小为30px（原50→30），减少跨格误匹配；
+           放宽重试从200→120，兜底从200→120；
+           保留形态学掩码验证确保线条在区域内存在。
     """
     x1, y1, x2, y2 = bbox
     h_img, w_img = img_gray.shape
+    cx = (x1 + x2) // 2
+    cy = (y1 + y2) // 2
 
     def _search(m):
-        """在给定margin下搜索四边。返回 (gl,gt,gr,gb) 或 None。"""
-        lx, rx = max(0, x1 - m), min(w_img - 1, x2 + m)
-        ty_roi, by_roi = max(0, y1 - m), min(h_img - 1, y2 + m)
+        lx, rx = max(0, cx - m), min(w_img - 1, cx + m)
+        ty_roi, by_roi = max(0, cy - m), min(h_img - 1, cy + m)
+
         top_cands, bot_cands = [], []
         for y, _, _ in h_lines:
             if y < 0 or y >= h_img:
                 continue
             if not np.any(hmask[y, lx:rx + 1]):
                 continue
-            if y <= y1:
+            if y <= cy:
                 top_cands.append(y)
-            if y >= y2:
+            if y >= cy:
                 bot_cands.append(y)
         top_cands.sort()
         bot_cands.sort()
+
         lft_cands, rgt_cands = [], []
         for x, _, _ in v_lines:
             if x < 0 or x >= w_img:
                 continue
             if not np.any(vmask[ty_roi:by_roi + 1, x]):
                 continue
-            if x <= x1:
+            if x <= cx:
                 lft_cands.append(x)
-            if x >= x2:
+            if x >= cx:
                 rgt_cands.append(x)
         lft_cands.sort()
         rgt_cands.sort()
+
         if not (top_cands and bot_cands and lft_cands and rgt_cands):
             return None
+
         gl, gt, gr, gb = lft_cands[-1], top_cands[-1], rgt_cands[0], bot_cands[0]
         cw, ch = gr - gl, gb - gt
         if not (CELL_MIN_W <= cw <= CELL_MAX_W and CELL_MIN_H <= ch <= CELL_MAX_H):
-            logger.debug(f"  [_find_table_cell] 尺寸不符: ({gl},{gt})-({gr},{gb}) {cw}x{ch}px "
-                         f"(允许{CELL_MIN_W}-{CELL_MAX_W} x {CELL_MIN_H}-{CELL_MAX_H})")
             return None
+
         # 白底验证
-        if gt + 2 < gb - 2 and gl + 2 < gr - 2:
-            roi = img_gray[gt + 2:gb - 2, gl + 2:gr - 2]
-            if roi.size == 0 or float(np.mean(roi > 180)) < CELL_WHITE_THRESHOLD:
-                return None
+        roi = img_gray[gt + 2:gb - 2, gl + 2:gr - 2] if gb - gt > 4 and gr - gl > 4 else None
+        if roi is None or roi.size == 0:
+            return None
+        if float(np.mean(roi > 180)) < CELL_WHITE_THRESHOLD:
+            return None
+
         return gl, gt, gr, gb
 
-    # 尝试标准margin
+    # 尝试标准margin（v3.0: 30px，比原来的50更紧）
     result = _search(margin)
     if result is not None:
         return result
 
-    # 扩大搜索范围重试（处理靠近页面边缘的单元格）
-    result = _search(max(margin, 200))
+    # 放宽重试（v3.0: 120px，比原来的200更紧）
+    result = _search(max(margin, 120))
     if result is not None:
-        logger.debug(f"  [_find_table_cell] 扩大margin=200成功: bbox({x1},{y1})-({x2},{y2})")
         return result
 
-    # 最后兜底：用图像边界替代缺失的格线
+    # 兜底：图像边界
     top_cands, bot_cands = [], []
     for y, _, _ in h_lines:
         if y < 0 or y >= h_img:
             continue
-        lx, rx = max(0, x1 - 200), min(w_img - 1, x2 + 200)
+        lx, rx = max(0, cx - 120), min(w_img - 1, cx + 120)
         if not np.any(hmask[y, lx:rx + 1]):
             continue
-        if y <= y1:
+        if y <= cy:
             top_cands.append(y)
-        if y >= y2:
+        if y >= cy:
             bot_cands.append(y)
     top_cands.sort()
     bot_cands.sort()
+
     lft_cands, rgt_cands = [], []
     for x, _, _ in v_lines:
         if x < 0 or x >= w_img:
             continue
-        ty_roi, by_roi = max(0, y1 - 200), min(h_img - 1, y2 + 200)
+        ty_roi, by_roi = max(0, cy - 120), min(h_img - 1, cy + 120)
         if not np.any(vmask[ty_roi:by_roi + 1, x]):
             continue
-        if x <= x1:
+        if x <= cx:
             lft_cands.append(x)
-        if x >= x2:
+        if x >= cx:
             rgt_cands.append(x)
     lft_cands.sort()
     rgt_cands.sort()
 
-    # 用图像边界补全缺失的边
     gl = lft_cands[-1] if lft_cands else 0
     gt = top_cands[-1] if top_cands else 0
     gr = rgt_cands[0] if rgt_cands else w_img - 1
     gb = bot_cands[0] if bot_cands else h_img - 1
+
     cw, ch = gr - gl, gb - gt
     if not (CELL_MIN_W <= cw <= CELL_MAX_W and CELL_MIN_H <= ch <= CELL_MAX_H):
         return None
-    if gt + 2 < gb - 2 and gl + 2 < gr - 2:
-        roi = img_gray[gt + 2:gb - 2, gl + 2:gr - 2]
-        if roi.size > 0 and float(np.mean(roi > 180)) < CELL_WHITE_THRESHOLD:
-            return None
-    logger.info(f"  [_find_table_cell] 边界兜底: bbox({x1},{y1})-({x2},{y2}) → ({gl},{gt})-({gr},{gb})")
+
+    roi = img_gray[gt + 2:gb - 2, gl + 2:gr - 2] if gb - gt > 4 and gr - gl > 4 else None
+    if roi is not None and roi.size > 0 and float(np.mean(roi > 180)) < CELL_WHITE_THRESHOLD:
+        return None
+
     return gl, gt, gr, gb
+
+
+def _is_in_table(item, h_lines, v_lines, hmask, vmask, img_gray):
+    """判断 OCR 块是否落在表格单元格内。"""
+    return _find_table_cell(item["bbox"], h_lines, v_lines, hmask, vmask, img_gray) is not None
 
 
 def _is_in_table(item, h_lines, v_lines, hmask, vmask, img_gray):
@@ -695,10 +1451,60 @@ def merge_ocr_items(items: list, img_bgr=None) -> list:
         h_lines, v_lines, hmask, vmask = _detect_table_lines(img_gray)
         print(f"  [表格线检测] 局部水平线 {len(h_lines)} 条, 局部竖线 {len(v_lines)} 条")
 
-        # === 阶段1: 全图格网检测 (v2.1: 传入OCR项用于过滤CAD假格) ===
-        all_cells, tbl_h, tbl_v = _detect_all_table_cells(h_lines, v_lines, hmask, vmask, img_gray, ocr_items=items)
+        # === 阶段1: 全图格网检测 (v3.1: 调度引擎 — CELL_DETECT_ENGINE 控制) ===
+        all_cells, tbl_h, tbl_v = _detect_all_table_cells_dispatch(
+            h_lines, v_lines, hmask, vmask, img_gray, img_bgr=img_bgr, ocr_items=items)
 
-        # === 阶段2: 分配OCR到格 ===
+        # === 阶段2: 分配OCR到格（先分割跨格文本） ===
+        # v2.4: 如果OCR条目的bbox跨越多条格子水平线，按线位比例分割。
+        # 这样"地脚\n螺栓直径\n螺纹长度"会被 y=8242 一线切分为两个格子各自的文本。
+        if all_cells:
+            h_lines_set = set()
+            for (cl, ct, cr, cb) in all_cells:
+                h_lines_set.add(ct)
+                h_lines_set.add(cb)
+            h_lines_sorted = sorted(h_lines_set)
+
+            split_items = []
+            for idx, item in enumerate(items):
+                x1, y1, x2, y2 = item["bbox"]
+                text = item["text"]
+                # 找落在bbox内部的水平线
+                crossing = [ly for ly in h_lines_sorted if y1 < ly < y2]
+                if "\n" in text and crossing:
+                    src_lines = text.split("\n")
+                    total_h = y2 - y1
+                    if len(src_lines) >= 2 and total_h > 0:
+                        # 按线位比例分割：找到每条线在文本中的分割点
+                        cut_points = sorted([(ly - y1) / total_h for ly in crossing])
+                        # 估算每行文本的位置比例（等分）
+                        line_ratio = 1.0 / len(src_lines)
+                        segments = []  # [(start_line, end_line), ...]
+                        cur = 0
+                        for cp in cut_points:
+                            split_line = int(cp / line_ratio)  # 哪一行被切
+                            split_line = max(cur, min(split_line, len(src_lines)))
+                            if split_line > cur:
+                                segments.append((cur, split_line))
+                            cur = split_line
+                        if cur < len(src_lines):
+                            segments.append((cur, len(src_lines)))
+
+                        if len(segments) > 1:
+                            logger.info(f"  [跨格分割] OCR#{idx} '{text[:40]}' 被线{[(round(ly,0)) for ly in crossing]}分割为{len(segments)}段")
+                            for seg_start, seg_end in segments:
+                                sub_text = "\n".join(src_lines[seg_start:seg_end])
+                                sy1 = int(y1 + total_h * seg_start / len(src_lines))
+                                sy2 = int(y1 + total_h * seg_end / len(src_lines))
+                                sub_item = dict(item)
+                                sub_item["text"] = sub_text
+                                sub_item["bbox"] = [x1, sy1, x2, sy2]
+                                split_items.append(sub_item)
+                            continue
+                split_items.append(item)
+            items = split_items
+            logger.info(f"  [跨格分割] 处理完成，{len(items)}个条目")
+
         cell_map = {}  # cell_key -> [items]
         unassigned = []
         for idx, item in enumerate(items):
@@ -1591,7 +2397,12 @@ def _generate_debug_cell_pdf(img_path: str, debug_pdf_path: str, dpi: int = 200)
     except Exception:
         debug_font = ImageFont.load_default()
 
+    drawn_count = 0
     for cell_key, cid in _cell_registry.items():
+        # v2.4: 只绘制含文本的单元格（过滤空格）
+        if cid not in _cell_texts or not _cell_texts[cid]:
+            continue
+        drawn_count += 1
         cl, ct, cr, cb = cell_key
         cw, ch = cr - cl, cb - ct
 
@@ -1621,7 +2432,7 @@ def _generate_debug_cell_pdf(img_path: str, debug_pdf_path: str, dpi: int = 200)
         draw.text((tx, ty), label, fill=(255, 0, 0, 255), font=cell_font)
 
     # 也标记未入格的OCR项（灰色虚线框）
-    logger.info(f"  [调试PDF] 已绘制 {len(_cell_registry)} 个单元格的红框+编号")
+    logger.info(f"  [调试PDF] 已绘制 {drawn_count}/{len(_cell_registry)} 个含文本单元格的红框+编号")
 
     # 保存为PNG再转PDF
     debug_png = debug_pdf_path.replace(".pdf", ".png")
@@ -1633,12 +2444,12 @@ def _generate_debug_cell_pdf(img_path: str, debug_pdf_path: str, dpi: int = 200)
 def main():
     _clear_cell_registry()  # 每次运行前重置注册表
     logger.info("=" * 60)
-    logger.info("Scan-type PDF CN->EN Translation (v2.0 Cell-First + Diagnostic Logging)")
+    logger.info("Scan-type PDF CN->EN Translation (v3.0 Multi-Strategy Cell Detection + Diagnostic Logging)")
     logger.info(f"日志文件: {LOG_FILE}")
     logger.info("=" * 60)
 
     print("=" * 60)
-    print("Scan-type PDF CN->EN Translation (v2.0 Cell-First with Diagnostics)")
+    print("Scan-type PDF CN->EN Translation (v3.0 Multi-Strategy Cell Detection)")
     print(f"  Log: {LOG_FILE}")
     print("=" * 60)
     if not os.path.exists(PDF_PATH):
