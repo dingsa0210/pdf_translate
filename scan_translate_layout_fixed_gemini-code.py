@@ -946,18 +946,19 @@ def _get_ppocr():
         import threading as _threading
 
         _t0 = _time.time()
-        logger.info(f"  [PP-Structure] 首次加载 PaddleOCR 引擎（超时={import_timeout}s）...")
+        logger.info("  [PP-Structure] 首次加载 PPStructureV3 引擎（超时={import_timeout}s）...")
 
         # 在后台线程中导入，主线程等待超时
         result = {"ocr": None, "error": None, "done": False}
 
         def _import_ppocr():
             try:
-                from paddleocr import PaddleOCR
-                result["ocr"] = PaddleOCR(
-                    use_doc_parser=False,
-                    lang='ch',
-                    use_gpu=False,
+                # TableRecognitionPipelineV2 = PP-Structure V2 表格识别管道
+                # 比 PPStructureV3 更轻量，专注于表格单元格检测
+                from paddleocr import TableRecognitionPipelineV2
+                result["ocr"] = TableRecognitionPipelineV2(
+                    use_doc_orientation_classify=False,
+                    use_doc_unwarping=False,
                 )
             except Exception as e:
                 result["error"] = str(e)
@@ -970,19 +971,19 @@ def _get_ppocr():
 
         if not result["done"]:
             _ppocr_available = False
-            logger.warning(f"  [PP-Structure] PaddleOCR 导入超时 ({import_timeout}s)。"
+            logger.warning(f"  [PP-Structure] PPStructureV3 导入超时 ({import_timeout}s)。"
                            f"CPU-only 环境建议使用 opencv_v3 引擎。"
                            f"可设置 PPOCR_IMPORT_TIMEOUT=600 延长等待。")
             return None
 
         if result["error"]:
             _ppocr_available = False
-            logger.warning(f"  [PP-Structure] PaddleOCR 导入失败: {result['error']}")
+            logger.warning(f"  [PP-Structure] PPStructureV3 导入失败: {result['error']}")
             return None
 
         _ppocr_instance = result["ocr"]
         _ppocr_available = True
-        logger.info(f"  [PP-Structure] PaddleOCR 引擎就绪 (耗时 {_time.time() - _t0:.1f}s)")
+        logger.info(f"  [PP-Structure] PPStructureV3 引擎就绪 (耗时 {_time.time() - _t0:.1f}s)")
         return _ppocr_instance
 
     except Exception as e:
@@ -993,13 +994,14 @@ def _get_ppocr():
 
 def _detect_all_table_cells_ppstructure(h_lines, v_lines, hmask, vmask,
                                          img_gray, img_bgr, ocr_items=None):
-    """PP-Structure 表格单元格检测：使用 PaddleOCR 内置的表格识别引擎。
+    """PPStructureV3 表格单元格检测：使用 PaddleOCR 的 PPStructureV3 管道。
 
     流程：
-      1. 用 PaddleOCR 对全图做 table recognition
-      2. 解析返回的 HTML/JSON 中的 cell 坐标
+      1. 用 PPStructureV3 对全图做表格结构识别
+      2. 解析返回的 cell_boxes 坐标
       3. 将 cell 坐标注入 _cell_registry
 
+    不可用时自动回退到 OpenCV v3 引擎。
     返回: [(left, top, right, bottom), ...], [], []
     """
     ocr = _get_ppocr()
@@ -1021,8 +1023,8 @@ def _detect_all_table_cells_ppstructure(h_lines, v_lines, hmask, vmask,
             'scan_work', '_ppstructure_input.png')
         _cv2.imwrite(tmp_path, img_bgr)
 
-        # 使用 PaddleOCR 3.x 的 predict 方法
-        result = ocr.predict(tmp_path, table=True)
+        # use_ocr_model=True: 管道自己做文字检测+识别，确保单元格有OCR锚定
+        result = ocr.predict(tmp_path, use_layout_detection=False, use_ocr_model=True)
 
         # 尝试清理临时文件
         try:
@@ -1061,21 +1063,20 @@ def _detect_all_table_cells_ppstructure(h_lines, v_lines, hmask, vmask,
 
 
 def _parse_paddleocr_table_result(result, img_gray):
-    """从 PaddleOCR 3.x 的表格识别结果中提取单元格坐标。
+    """从 TableRecognitionPipelineV2 的表格识别结果中提取单元格坐标。
 
-    PaddleOCR 3.x 返回格式（list of dict）:
+    输出格式（list of TableRecognitionResult-like dict）:
       [{
         'input_path': '...',
-        'table_res': {
-          'cell_boxes': [[x1,y1,x2,y2], ...],  # 单元格坐标
-          'html': '<table>...</table>',
-        }
+        'table_res_list': [
+          {'cell_box_list': [[x1,y1,x2,y2], ...], 'html': '...'},
+          ...
+        ]
       }]
 
     返回: [(left, top, right, bottom), ...]
     """
     cells = []
-    h_img, w_img = img_gray.shape
 
     if not result or not isinstance(result, list):
         return cells
@@ -1084,23 +1085,29 @@ def _parse_paddleocr_table_result(result, img_gray):
         if not isinstance(res_item, dict):
             continue
 
-        # 尝试多种可能的 key 名
-        table_res = res_item.get('table_res') or res_item.get('tables') or {}
-        if isinstance(table_res, list):
-            # 多个表格的情况
-            for tbl in table_res:
+        # TableRecognitionPipelineV2: table_res_list[].cell_box_list
+        table_res_list = res_item.get('table_res_list', [])
+        if isinstance(table_res_list, list):
+            for tbl in table_res_list:
                 if isinstance(tbl, dict):
-                    cell_boxes = tbl.get('cell_boxes', [])
-                    cells.extend(_validate_and_filter_cells(cell_boxes, img_gray))
-        elif isinstance(table_res, dict):
-            cell_boxes = table_res.get('cell_boxes', [])
-            cells.extend(_validate_and_filter_cells(cell_boxes, img_gray))
+                    # 优先: cell_box_list (PaddleX 原生格式)
+                    cell_boxes = tbl.get('cell_box_list', [])
+                    if cell_boxes:
+                        cells.extend(_validate_and_filter_cells(cell_boxes, img_gray))
+                    # 备选: cell_boxes
+                    cell_boxes2 = tbl.get('cell_boxes', [])
+                    if cell_boxes2:
+                        cells.extend(_validate_and_filter_cells(cell_boxes2, img_gray))
 
-        # 尝试从 'res' 字段获取
+        # 兼容 PPStructureV3 格式: res.tables[].cell_boxes
         res = res_item.get('res', {})
         if isinstance(res, dict):
-            cell_boxes = res.get('cell_boxes', [])
-            cells.extend(_validate_and_filter_cells(cell_boxes, img_gray))
+            tables = res.get('tables', [])
+            if isinstance(tables, list):
+                for tbl in tables:
+                    if isinstance(tbl, dict):
+                        cell_boxes = tbl.get('cell_boxes', [])
+                        cells.extend(_validate_and_filter_cells(cell_boxes, img_gray))
 
     return cells
 
