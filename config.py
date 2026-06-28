@@ -39,6 +39,8 @@ FONT_PATH = os.environ.get("FONT_PATH", r"C:\Windows\Fonts\arial.ttf")
 # ============================================================
 CELL_DETECT_ENGINE = os.environ.get("CELL_DETECT_ENGINE", "opencv_v3")
 
+# 导入ppstructure时的超时时间（秒）
+PPOCR_IMPORT_TIMEOUT = int(os.environ.get("PPOCR_IMPORT_TIMEOUT", "1800"))
 # ============================================================
 # 工程术语字典 (从外部 JSON 文件加载)
 # ============================================================
