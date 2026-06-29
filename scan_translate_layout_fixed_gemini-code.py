@@ -51,7 +51,7 @@ CELL_MIN_H = int(os.environ.get("CELL_MIN_H", "20"))
 CELL_MAX_W = int(os.environ.get("CELL_MAX_W", "1200"))
 CELL_MAX_H = int(os.environ.get("CELL_MAX_H", "400"))  # 放宽到400px，容纳多行单元格（如"借（通）用\n件登记"）
 CELL_ERASE_INSET = int(os.environ.get("CELL_ERASE_INSET", "2"))  # 格内擦除缩进，保护格线
-CELL_WHITE_THRESHOLD = float(os.environ.get("CELL_WHITE_THRESHOLD", "0.80"))  # 格内白底比例
+CELL_WHITE_THRESHOLD = float(os.environ.get("CELL_WHITE_THRESHOLD", "0.65"))  # 格内白底比例（原0.80→0.65，文本密集格容错）
 # CELL_DETECT_ENGINE 已从 config.py 导入，通过 .env 文件配置
 
 # ---- loguru 日志配置 ----
@@ -474,11 +474,11 @@ def _group_coords(coords, gap=4):
 # ═══════════════════════════════════════════════════════════════
 
 # ---- 新增检测常量 ----
-HOUGH_THRESH = int(os.environ.get("HOUGH_THRESH", "40"))        # Hough线检测投票阈值
-HOUGH_MIN_LEN = int(os.environ.get("HOUGH_MIN_LEN", "30"))       # 最小线段长（远小于原来的200px）
-HOUGH_MAX_GAP = int(os.environ.get("HOUGH_MAX_GAP", "8"))        # 线段断裂容忍
-GRID_INTERSECT_DENSITY = int(os.environ.get("GRID_INTERSECT_DENSITY", "3"))  # 表格线至少与N条垂直线相交
-CAD_LINE_MAX_INTERSECT = int(os.environ.get("CAD_LINE_MAX_INTERSECT", "2"))  # CAD线最多与N条线相交
+HOUGH_THRESH = int(os.environ.get("HOUGH_THRESH", "20"))        # Hough线检测投票阈值（降低，CAD细线像素少）
+HOUGH_MIN_LEN = int(os.environ.get("HOUGH_MIN_LEN", "15"))       # 最小线段长（原30→15，短竖线也能捕获）
+HOUGH_MAX_GAP = int(os.environ.get("HOUGH_MAX_GAP", "15"))       # 线段断裂容忍（原8→15，连接断线）
+GRID_INTERSECT_DENSITY = int(os.environ.get("GRID_INTERSECT_DENSITY", "2"))  # 表格线至少与N条垂直线相交（原3→2，含边缘线）
+CAD_LINE_MAX_INTERSECT = int(os.environ.get("CAD_LINE_MAX_INTERSECT", "1"))  # CAD线最多与N条线相交（原2→1，更激进排除）
 
 
 def _detect_all_line_segments(img_gray):
@@ -489,12 +489,15 @@ def _detect_all_line_segments(img_gray):
     """
     h_img, w_img = img_gray.shape
 
-    # 1. 自适应二值化（比OTSU对CAD图纸更友好）
-    bw = cv2.adaptiveThreshold(img_gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                                cv2.THRESH_BINARY_INV, 31, 8)
+    # 1. 双通道二值化：自适应（局部对比度）+ OTSU（全局阈值），互补捕捉细线
+    bw_adaptive = cv2.adaptiveThreshold(img_gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                         cv2.THRESH_BINARY_INV, 21, 6)  # 块21→更敏感
+    bw_otsu = cv2.threshold(img_gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)[1]
+    # 合并两种二值化结果（取OR，保留所有可能的线段像素）
+    bw = cv2.bitwise_or(bw_adaptive, bw_otsu)
 
-    # 2. Canny边缘检测
-    edges = cv2.Canny(bw, 50, 150, apertureSize=3)
+    # 2. Canny边缘检测（更低阈值捕捉CAD细线，1-2px边缘能量低）
+    edges = cv2.Canny(bw, 20, 80, apertureSize=3)
 
     # 3. 概率Hough线段检测
     lines = cv2.HoughLinesP(edges, 1, np.pi / 180, HOUGH_THRESH,
@@ -553,7 +556,7 @@ def _detect_rectangular_contours(img_gray):
         if rect_area == 0:
             continue
         rectangularity = area / rect_area
-        if rectangularity < 0.75:  # 至少75%填充率才算矩形
+        if rectangularity < 0.55:  # v3.2: 原0.75→0.55，细线框轮廓面积小
             continue
 
         # 白底验证
@@ -585,10 +588,10 @@ def _build_line_intersection_grid(h_segs, v_segs, img_gray):
 
     h_img, w_img = img_gray.shape
     INTERSECT_WINDOW = 100  # 交点搜索窗口（px）
-    MIN_INTERSECTIONS = 3   # 表格线至少与3条垂直线相交
+    MIN_INTERSECTIONS = GRID_INTERSECT_DENSITY  # 用常量，默认2（原硬编码3）
 
     # 归一化线段为坐标
-    def _normalize(segs, is_horizontal, gap=8):
+    def _normalize(segs, is_horizontal, gap=5):
         coords = {}
         for (x1, y1, x2, y2) in segs:
             key = (y1 + y2) // 2 if is_horizontal else (x1 + x2) // 2
@@ -609,25 +612,10 @@ def _build_line_intersection_grid(h_segs, v_segs, img_gray):
             merged[merged_k].extend(coords[k])
         return {mk: merged[mk] for mk in sorted(merged.keys())}
 
-    h_merged = _normalize(h_segs, is_horizontal=True, gap=6)
-    v_merged = _normalize(v_segs, is_horizontal=False, gap=6)
+    h_merged = _normalize(h_segs, is_horizontal=True, gap=5)
+    v_merged = _normalize(v_segs, is_horizontal=False, gap=5)
 
     # 计算每条横线与竖线的交点数量
-    def _count_intersections(line_ys, other_coords, window=INTERSECT_WINDOW):
-        """对每条横线y，统计在window范围内的竖线数量"""
-        counts = {}
-        for y in line_ys:
-            cnt = sum(1 for x in other_coords if abs(x - y) <= window or True)
-            # 对横线：竖线穿过它 = 竖线的y范围包含横向y
-            cnt = 0
-            for x, ranges in other_coords.items():
-                for (r1, r2) in ranges:
-                    if r1 <= y <= r2:
-                        cnt += 1
-                        break
-            counts[y] = cnt
-        return counts
-
     h_intersect_counts = {}
     for y in h_merged:
         cnt = 0
@@ -648,7 +636,7 @@ def _build_line_intersection_grid(h_segs, v_segs, img_gray):
                     break
         v_intersect_counts[x] = cnt
 
-    # 过滤：只保留≥MIN_INTERSECTIONS交点的"表格线"
+    # 过滤：只保留≥MIN_INTERSECTIONS交点的"表格线"（边缘线也可能只有2个交点，降低门槛）
     h_filtered = [y for y, c in h_intersect_counts.items() if c >= MIN_INTERSECTIONS]
     v_filtered = [x for x, c in v_intersect_counts.items() if c >= MIN_INTERSECTIONS]
 
@@ -658,7 +646,38 @@ def _build_line_intersection_grid(h_segs, v_segs, img_gray):
     if len(h_filtered) < 2 or len(v_filtered) < 2:
         return []
 
-    # 生成候选格（仅用过滤后的线）
+    # v3.2: 四边封闭验证辅助函数
+    # 检查在y坐标附近是否存在水平线段覆盖[x1, x2]（容差=tolerance）
+    def _has_h_segment_near(y, x1, x2, tolerance=6):
+        for seg_y, ranges in h_merged.items():
+            if abs(seg_y - y) <= tolerance:
+                for (r1, r2) in ranges:
+                    if r1 <= x1 + tolerance and r2 >= x2 - tolerance:
+                        return True
+        # 放宽到原始线段级别再试
+        tol2 = tolerance + 4
+        for seg_y, ranges in h_merged.items():
+            if abs(seg_y - y) <= tol2:
+                for (r1, r2) in ranges:
+                    if r1 <= x1 + tol2 and r2 >= x2 - tol2:
+                        return True
+        return False
+
+    def _has_v_segment_near(x, y1, y2, tolerance=6):
+        for seg_x, ranges in v_merged.items():
+            if abs(seg_x - x) <= tolerance:
+                for (r1, r2) in ranges:
+                    if r1 <= y1 + tolerance and r2 >= y2 - tolerance:
+                        return True
+        tol2 = tolerance + 4
+        for seg_x, ranges in v_merged.items():
+            if abs(seg_x - x) <= tol2:
+                for (r1, r2) in ranges:
+                    if r1 <= y1 + tol2 and r2 >= y2 - tol2:
+                        return True
+        return False
+
+    # 生成候选格（仅用过滤后的线）+ 四边封闭验证
     cells = []
     for i in range(len(h_filtered) - 1):
         for j in range(len(v_filtered) - 1):
@@ -668,12 +687,26 @@ def _build_line_intersection_grid(h_segs, v_segs, img_gray):
             if not (CELL_MIN_W <= cw <= CELL_MAX_W and CELL_MIN_H <= ch <= CELL_MAX_H):
                 continue
 
-            # 验证角点
+            # v3.2: 四边封闭验证（替代旧版仅检查3个角点）
+            top_ok = _has_h_segment_near(top, lft, rgt, tolerance=5)
+            bot_ok = _has_h_segment_near(bot, lft, rgt, tolerance=5)
+            lft_ok = _has_v_segment_near(lft, top, bot, tolerance=5)
+            rgt_ok = _has_v_segment_near(rgt, top, bot, tolerance=5)
+            sides_ok = sum([top_ok, bot_ok, lft_ok, rgt_ok])
+
+            # 至少三边有线段证据（有一条边可能是虚线或轻微断线）
+            if sides_ok < 3:
+                continue
+
+            # 对于仅有3条边的，放宽角点检查
+            if sides_ok == 3:
+                check_margin = 10  # 放宽角点检查窗口
+            else:
+                check_margin = 6
+
+            # 角点验证：至少2个角点有暗像素（确认真实闭合）
             corners_ok = 0
-            check_margin = 8
-            corners = [
-                (top, lft), (top, rgt), (bot, lft)
-            ]
+            corners = [(top, lft), (top, rgt), (bot, lft), (bot, rgt)]
             for cy_c, cx_c in corners:
                 y1p = max(0, int(cy_c) - check_margin)
                 y2p = min(h_img, int(cy_c) + check_margin)
@@ -691,12 +724,13 @@ def _build_line_intersection_grid(h_segs, v_segs, img_gray):
             roi = img_gray[top + 2:bot - 2, lft + 2:rgt - 2] if bot - top > 4 and rgt - lft > 4 else None
             if roi is None or roi.size == 0:
                 continue
-            if float(np.mean(roi > 180)) < CELL_WHITE_THRESHOLD:
+            # v3.2: 降低白底阈值，文本密集的格白底比例可能不高
+            if float(np.mean(roi > 180)) < CELL_WHITE_THRESHOLD * 0.85:
                 continue
 
             cells.append((lft, top, rgt, bot))
 
-    logger.info(f"  [线交叉网格] 生成 {len(cells)} 个候选格")
+    logger.info(f"  [线交叉网格] 生成 {len(cells)} 个候选格（含四边封闭验证）")
     return cells
 
 
@@ -877,9 +911,9 @@ def _detect_table_lines(img_gray):
     h_img, w_img = img_gray.shape
     # 保留旧版形态学掩码（供 _find_table_cell 回退使用）
     bw = cv2.threshold(img_gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)[1]
-    h_len = max(30, 120)
+    h_len = max(20, 80)  # 原(30,120)→(20,80)，匹配新阈值
     hmask = cv2.morphologyEx(bw, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (h_len, 1))) > 0
-    v_len = max(30, 120)
+    v_len = max(20, 80)
     vmask = cv2.morphologyEx(bw, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (1, v_len))) > 0
 
     # v3.0 新增：多尺度线段检测（替代旧的 >200px 长线过滤）
@@ -1179,7 +1213,7 @@ def _detect_all_table_cells_opencv(h_lines, v_lines, hmask, vmask, img_gray, ocr
     """OpenCV v3.1 多策略单元格检测级联（带约束）：
     阶段A: 轮廓矩形检测 — 精确捕获闭合单元格
     阶段B: 线交叉网格 — 仅用≥3交点的线构建候选格（排除CAD线）
-    阶段C: 文本间隙推理 — 仅在A+B已有格的区域运行
+    阶段C: 文本间隙推理 — 默认禁用 (OCR位置不可靠)；ENABLE_TEXT_GAP_CELLS=1 启用（带containment过滤）
     阶段D: 回退 — 对未覆盖的OCR项，调用 _find_table_cell
     后过滤: 移除不含OCR文本的孤立格
     """
@@ -1201,16 +1235,33 @@ def _detect_all_table_cells_opencv(h_lines, v_lines, hmask, vmask, img_gray, ocr
         cells_set.add(c)
     logger.info(f"  [阶段B] 线交叉网格: {len(grid_cells)} 个候选格")
 
-    # === 阶段C: 文本间隙推理（v3.1: 仅在A+B表格密集区运行） ===
-    if ocr_items:
+    # === 阶段C: 文本间隙推理（v3.2: 默认禁用，防止OCR字符间距误创假格拆分真实单元格） ===
+    # 规则：封闭框内不应包含除文本外的其它线框。OCR字符间距不应被当作格线。
+    # 若确实需要启用，设置环境变量 ENABLE_TEXT_GAP_CELLS=1
+    gap_cells = []
+    enable_gap = os.environ.get("ENABLE_TEXT_GAP_CELLS", "0") == "1"
+    if enable_gap and ocr_items:
         existing_before_c = list(cells_set)
         gap_cells = _find_cells_by_text_gaps(ocr_items, img_gray, existing_cells=existing_before_c)
+        # v3.2 安全过滤：移除被已有A+B格完全包含的gap格（防拆分）
+        gap_filtered = []
+        for gc in gap_cells:
+            gl, gt, gr, gb = gc
+            contained_in_existing = any(
+                el <= gl and et <= gt and er >= gr and eb >= gb and (el != gl or et != gt or er != gr or eb != gb)
+                for (el, et, er, eb) in existing_before_c
+            )
+            if not contained_in_existing:
+                gap_filtered.append(gc)
+            else:
+                logger.debug(f"  [阶段C过滤] 移除被A+B格包含的gap格 ({gl},{gt})-({gr},{gb}) "
+                             f"{gr-gl}x{gb-gt}px — 防止拆分真实单元格")
+        gap_cells = gap_filtered
         for c in gap_cells:
             cells_set.add(c)
-        logger.info(f"  [阶段C] 文本间隙推理: {len(gap_cells)} 个候选格")
+        logger.info(f"  [阶段C] 文本间隙推理: {len(gap_cells)} 个候选格（已过滤被包含格）")
     else:
-        gap_cells = []
-        logger.info(f"  [阶段C] 无OCR项，跳过文本间隙推理")
+        logger.info(f"  [阶段C] 文本间隙推理: 已禁用 (ENABLE_TEXT_GAP_CELLS={os.environ.get('ENABLE_TEXT_GAP_CELLS','0')})")
 
     # === 阶段D: 回退 _find_table_cell（覆盖前三个阶段遗漏的OCR文本） ===
     fallback_count = 0
