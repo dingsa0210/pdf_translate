@@ -34,9 +34,9 @@ from config import (
     CELL_DETECT_ENGINE,
 )
 
-PDF_PATH = r"d:\AIGC\projects\pdf_translate\pdfs\20260523-Rolling Mill Foundation Plan GZL24.7-17.8基础平面图-V2.0_1.pdf"
-WORK_DIR = r"d:\AIGC\projects\pdf_translate\scan_work"
-OUTPUT_PDF = r"d:\AIGC\projects\pdf_translate\pdfs\20260523-Rolling Mill Foundation Plan GZL24.7-17.8基础平面图-V2.0_1_translated.pdf"
+PDF_PATH = r"/Users/a1/projects/pdf_translate/pdfs/20260523-Rolling Mill Foundation Plan GZL24.7-17.8基础平面图-V2.0_1.pdf"
+WORK_DIR = r"/Users/a1/projects/pdf_translate/scan_work"
+OUTPUT_PDF = r"/Users/a1/projects/pdf_translate/pdfs/20260523-Rolling Mill Foundation Plan GZL24.7-17.8基础平面图-V2.0_1_translated.pdf"
 
 # ---- 版面渲染控制常量（可由环境变量覆盖）----
 # 近水平判定阈值：合并分类与回填走水平/旋转分支必须用同一阈值，
