@@ -2539,6 +2539,87 @@ def image_to_pdf(img_path, output_pdf, dpi=200):
     print(f"  Output PDF: {output_pdf}")
 
 
+def _generate_debug_ocr_pdf(img_path: str, ocr_items: list, debug_pdf_path: str, dpi: int = 200):
+    """生成OCR识别结果调试PDF：将所有OCR检测到的文本框用多边形标出，标注文本和置信度。
+
+    用于目视验证OCR识别质量：检查文本框是否准确包围文字、是否有遗漏或误识别。
+    - 绿色框：高置信度 (≥0.9)
+    - 黄色框：中等置信度 (0.7-0.9)
+    - 红色框：低置信度 (<0.7)
+    """
+    if not ocr_items:
+        logger.warning("  [OCR调试PDF] 无OCR识别结果，跳过生成")
+        return
+
+    from PIL import ImageDraw as IDraw
+    pil_img = Image.open(img_path).convert("RGBA")
+    draw = IDraw.Draw(pil_img)
+
+    # 尝试加载小号字体
+    try:
+        label_font = _load_font(FONT_PATH, 10)
+    except Exception:
+        label_font = ImageFont.load_default()
+
+    for i, item in enumerate(ocr_items):
+        box = item.get("box", [])
+        text = item.get("text", "")
+        conf = item.get("confidence", 0)
+
+        # 按置信度选颜色
+        if conf >= 0.9:
+            color = (0, 200, 0, 220)       # 绿色
+        elif conf >= 0.7:
+            color = (220, 180, 0, 220)     # 黄色
+        else:
+            color = (220, 50, 50, 220)     # 红色
+
+        # 绘制OCR识别的四边形框
+        if len(box) >= 4:
+            pts = [(int(p[0]), int(p[1])) for p in box[:4]]
+            draw.polygon(pts, outline=color, width=2)
+        elif len(box) >= 2:
+            # 回退：用bbox矩形
+            bbox = item.get("bbox", [])
+            if len(bbox) == 4:
+                x1, y1, x2, y2 = bbox
+                draw.rectangle([x1, y1, x2, y2], outline=color, width=2)
+
+        # 标注文本和置信度（在框左上角外侧）
+        bbox = item.get("bbox", [])
+        if len(bbox) == 4:
+            x1, y1, x2, y2 = bbox
+            label = f"#{i+1} {text} ({conf:.2f})"
+        else:
+            label = f"#{i+1} {text} ({conf:.2f})"
+
+        # 截断过长标签
+        if len(label) > 40:
+            label = label[:37] + "..."
+
+        tb = draw.textbbox((0, 0), label, font=label_font)
+        tw, th = tb[2] - tb[0], tb[3] - tb[1]
+
+        # 标签放在框上方，如果上方空间不够就放在框内
+        label_x = bbox[0] if len(bbox) == 4 else 10
+        label_y = max(0, (bbox[1] if len(bbox) == 4 else 10) - th - 4)
+
+        # 白底衬底
+        draw.rectangle([label_x - 1, label_y - 1, label_x + tw + 1, label_y + th + 1],
+                       fill=(255, 255, 255, 200))
+        draw.text((label_x, label_y), label, fill=color[:3] + (255,), font=label_font)
+
+    logger.info(f"  [OCR调试PDF] 已绘制 {len(ocr_items)} 个OCR文本框（绿={sum(1 for i in ocr_items if i.get('confidence', 0) >= 0.9)}, "
+                f"黄={sum(1 for i in ocr_items if 0.7 <= i.get('confidence', 0) < 0.9)}, "
+                f"红={sum(1 for i in ocr_items if i.get('confidence', 0) < 0.7)}）")
+
+    # 保存为PNG再转PDF
+    debug_png = debug_pdf_path.replace(".pdf", ".png")
+    pil_img.convert("RGB").save(debug_png)
+    image_to_pdf(debug_png, debug_pdf_path, dpi=dpi)
+    logger.info(f"  [OCR调试PDF] 已保存: {debug_pdf_path}")
+
+
 def _generate_debug_cell_pdf(img_path: str, debug_pdf_path: str, dpi: int = 200):
     """生成单元格调试PDF：将所有注册的单元格用红框标出，格内填写Cell_XXX编号。
 
@@ -2625,6 +2706,10 @@ def main():
     print("\n[Step 2] RapidOCR (chunked) recognition...")
     raw_ocr_items = ocr_with_rapid_chunked(img_path, chunk_size=CHUNK_SIZE)
     logger.info(f"OCR完成: 识别到 {len(raw_ocr_items)} 个中文文本块")
+
+    print("\n[Step 2.1] Generate OCR Debug PDF (bounding boxes)...")
+    ocr_debug_pdf = os.path.join(WORK_DIR, "ocr_debug.pdf")
+    _generate_debug_ocr_pdf(img_path, raw_ocr_items, ocr_debug_pdf, dpi=page_meta["dpi"])
 
     print("\n[Step 2.5] Cell-First Intelligent Block Merging...")
     # 传入渲染图像，用于检测表格网格并抑制跨单元格合并（保护表格边框/单元格独立）
