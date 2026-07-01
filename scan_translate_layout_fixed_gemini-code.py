@@ -50,7 +50,7 @@ CELL_MIN_W = int(os.environ.get("CELL_MIN_W", "20"))
 CELL_MIN_H = int(os.environ.get("CELL_MIN_H", "20"))
 CELL_MAX_W = int(os.environ.get("CELL_MAX_W", "1200"))
 CELL_MAX_H = int(os.environ.get("CELL_MAX_H", "400"))  # 放宽到400px，容纳多行单元格（如"借（通）用\n件登记"）
-CELL_ERASE_INSET = int(os.environ.get("CELL_ERASE_INSET", "2"))  # 格内擦除缩进，保护格线
+CELL_ERASE_INSET = int(os.environ.get("CELL_ERASE_INSET", "1"))  # 格内擦除缩进，保护格线
 CELL_WHITE_THRESHOLD = float(os.environ.get("CELL_WHITE_THRESHOLD", "0.65"))  # 格内白底比例（原0.80→0.65，文本密集格容错）
 # CELL_DETECT_ENGINE 已从 config.py 导入，通过 .env 文件配置
 
@@ -296,10 +296,10 @@ def translate_with_dictionary(text_items: list) -> list:
 
 
 def translate_with_llm(text_items: list) -> list:
-    """使用独立结构化标签组进行LLM翻译，杜绝数字编号错位干扰。
+    """使用独立结构化标签组进行LLM翻译，带持久化翻译缓存。
 
-    v2.0: 单元格内保留原文换行结构（不再合并），让模型按行翻译，
-          回填时可按原文行结构还原排版。
+    缓存策略：scan_work/translation_cache.json 保存所有已翻译文本。
+    命中缓存直接使用，未命中才调LLM，翻译后自动更新缓存。
     """
     try:
         from openai import OpenAI
@@ -311,31 +311,52 @@ def translate_with_llm(text_items: list) -> list:
         print("LLM API 配置不完整，回退到术语字典翻译")
         return translate_with_dictionary(text_items)
 
+    # 1. 加载翻译缓存
+    cache_path = os.path.join(WORK_DIR, "translation_cache.json")
+    cache = {}
+    if os.path.exists(cache_path):
+        try:
+            with open(cache_path, "r", encoding="utf-8") as f:
+                cache = json.load(f)
+            print(f"  已加载翻译缓存: {len(cache)} 条")
+        except Exception:
+            pass
+
+    # 2. 先走术语字典
     text_items = translate_with_dictionary(text_items)
 
+    # 3. 术语字典 + 缓存 都命中则跳过
+    cache_hits = 0
     items_for_llm = []
     for i, item in enumerate(text_items):
-        if "translated" not in item or item["translated"] == item["text"]:
-            items_for_llm.append((i, item))
+        text = item["text"]
+        if "translated" in item and item["translated"] != text:
+            continue  # 术语字典已翻译
+        if text in cache:
+            item["translated"] = cache[text]
+            cache_hits += 1
+            continue
+        items_for_llm.append((i, item))
+
+    if cache_hits:
+        print(f"  翻译缓存命中: {cache_hits} 条")
 
     if not items_for_llm:
-        print("  All items translated by dictionary, skipping LLM")
+        print("  所有文本已在缓存/字典中，跳过 LLM 调用")
         return text_items
 
-    print(f"  Dictionary translated {len(text_items) - len(items_for_llm)} items, sending {len(items_for_llm)} to LLM")
+    print(f"  字典+缓存覆盖 {len(text_items) - len(items_for_llm)} 条, 需 LLM 翻译: {len(items_for_llm)} 条")
 
     client = OpenAI(base_url=LLM_API_BASE, api_key=LLM_API_KEY)
     dict_sample = "\n".join([f'  "{cn}" → "{en}"' for cn, en in list(ENGINEERING_DICT.items())[:20]])
 
     system_prompt = f"""You are an expert CAD drawing translation assistant specializing in mechanical engineering.
-Translate Chinese technical descriptions into professional English.
-Guidelines:
-1. Use standard international engineering terminology (ISO/DIN/GB standard).
-2. Extremely short! Use standard abbreviations (e.g., Int. for Intermediate, Mat'l for Material, Req. for Requirements, Thk. for Thickness, DWG for Drawing, Qty. for Quantity, Dia. for Diameter, Lgth. for Length, No. for Number, Grd. for Grade).
-3. If the source text contains numbers, symbols, or multi-line enumerations, preserve their internal structures EXACTLY.
-4. For multi-line inputs, translate line-by-line. Keep the exact line breaks, ordering, and bullet numbers. Never merge lines or collapse lists.
-5. Strict Format: You MUST output using the structured tags. Respond ONLY with [ITEM_START], ID, TRN, and [ITEM_END]. No extra prose.
-6. CRITICAL for table cells, annotations, labels: output ≤3 words. Abbreviate aggressively! e.g. "Anchor Bolt Dia.", "Nut Exposed Lgth.", "Sec. Grouting Thk.", "Reserved Hole Size"
+Translate Chinese technical descriptions into the SHORTEST possible professional English.
+CRITICAL RULES:
+1. BREVITY IS EVERYTHING. Target 1-3 words MAX. Single words preferred. Aggressively abbreviate everything: Int., Mat'l, Req., Thk., DWG, Qty., Dia., Lgth., No., Grd., Dim., Tol., Surf., Ass'y, Req'd, Min., Max., Ref., Spec., Sec., Grnd., Fdn., Elev., Horiz., Vert., Incl., w/, w/o.
+2. For multi-word phrases, abbreviate every word: "Surface Roughness" → "Surf. Rough."; "Foundation Plan" → "Fdn. Plan"
+3. Preserve numbers, codes, symbols, and line structures EXACTLY. Never reorder, merge, or collapse lines.
+4. Strict Format: output ONLY with structured tags. No extra prose, no explanations.
 
 Example Input:
 [ITEM_START]
@@ -343,12 +364,20 @@ ID: 99
 SRC: 4. 技术要求
 图纸中材料为参考
 [ITEM_END]
+[ITEM_START]
+ID: 100
+SRC: 轧辊表面硬度应符合GB/T标准
+[ITEM_END]
 
 Example Output:
 [ITEM_START]
 ID: 99
-TRN: 4. Tech. Requirements
+TRN: 4. Tech. Req.
 Mat'l ref. only
+[ITEM_END]
+[ITEM_START]
+ID: 100
+TRN: Roll surf. hardness per GB/T
 [ITEM_END]
 
 Terminology references:
@@ -356,13 +385,12 @@ Terminology references:
 
     batch_size = LLM_BATCH_SIZE
     total_batches = (len(items_for_llm) + batch_size - 1) // batch_size
+    new_cache_entries = 0
 
     for batch_idx in range(0, len(items_for_llm), batch_size):
         batch = items_for_llm[batch_idx: batch_idx + batch_size]
         batch_num = batch_idx // batch_size + 1
 
-        # 构建高隔离度的结构化输入报文。
-        # v2.0: 保留单元格原文换行结构，让模型按行翻译
         user_prompt = "待翻译文本块列表如下：\n\n"
         for orig_idx, item in batch:
             src_text = item['text']
@@ -380,41 +408,49 @@ Terminology references:
             )
 
             result_text = response.choices[0].message.content
-            
-            # 使用高鲁棒性的正则块提取解析器
+
+            # 高鲁棒性正则块提取
             trans_map = {}
             blocks = re.findall(r"\[ITEM_START\](.*?)\[ITEM_END\]", result_text, re.DOTALL)
-            
+
             for block in blocks:
                 id_match = re.search(r"ID:\s*(\d+)", block)
-                # 优先取 TRN 字段（模型实际输出的译文）；
-                # 仅当模型漏掉 TRN 标签时才回退到 SRC，避免译文被原文覆盖
-                trn_match = re.search(r"TRN:\s*(.*?)(?:\n\[ITEM_END\]|\Z)", block, re.DOTALL)
+                trn_match = re.search(r"TRN:\s*(.*?)(?=\n\[ITEM_END\]|\Z)", block, re.DOTALL)
                 if not trn_match:
                     trn_match = re.search(r"SRC:\s*(.*)", block, re.DOTALL)
                 if id_match and trn_match:
                     idx = int(id_match.group(1))
                     trans_map[idx] = trn_match.group(1).strip()
 
-            # 回填翻译结果
+            # 回填翻译结果 + 更新缓存
             success_this_batch = 0
             for orig_idx, item in batch:
                 if orig_idx in trans_map:
                     translated = trans_map[orig_idx]
                     item["translated"] = translated
+                    # 写入缓存
+                    if item["text"] not in cache:
+                        cache[item["text"]] = translated
+                        new_cache_entries += 1
                     success_this_batch += 1
                 else:
-                    # 未匹配时的兜底策略
                     item["translated"] = item["text"]
 
-            print(f"  批次 {batch_num}/{total_batches}: 标签解析成功 {success_this_batch}/{len(batch)} 条")
+            print(f"  批次 {batch_num}/{total_batches}: 成功 {success_this_batch}/{len(batch)} 条")
             time.sleep(0.3)
 
         except Exception as e:
-            print(f"  批次 {batch_num}/{total_batches} 异常: {e}，启用字典兜底替换")
+            print(f"  批次 {batch_num}/{total_batches} 异常: {e}，未翻译项保持原文")
             for orig_idx, item in batch:
                 if "translated" not in item:
                     item["translated"] = item["text"]
+
+    # 4. 保存更新后的缓存
+    if new_cache_entries > 0:
+        os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+        with open(cache_path, "w", encoding="utf-8") as f:
+            json.dump(cache, f, ensure_ascii=False, indent=2)
+        print(f"  翻译缓存已更新: +{new_cache_entries} 条 (总计 {len(cache)} 条)")
 
     return text_items
 
@@ -1781,10 +1817,11 @@ def merge_ocr_items(items: list, img_bgr=None) -> list:
 
         while not block_locked:
             added = False
-            curr_x1 = current_block[-1]["bbox"][0]
-            curr_x2 = current_block[-1]["bbox"][2]
-            curr_y2 = current_block[-1]["bbox"][3]
-            curr_h = curr_y2 - current_block[-1]["bbox"][1]
+            last = current_block[-1]
+            curr_x1, curr_x2 = last["bbox"][0], last["bbox"][2]
+            curr_y2 = last["bbox"][3]
+            curr_h = curr_y2 - last["bbox"][1]
+            curr_cx = (curr_x1 + curr_x2) / 2  # 当前行水平中心
 
             best_next_idx = None
             best_next_gap = float('inf')
@@ -1798,15 +1835,31 @@ def merge_ocr_items(items: list, img_bgr=None) -> list:
 
                 nx1, ny1, nx2, ny2 = next_item["bbox"]
                 nh = ny2 - ny1
+                ncx = (nx1 + nx2) / 2
 
-                # 判定条件：1. 纵向相邻间距在一行高度的1.5倍以内
+                # 判定条件：1. 纵向相邻间距在平均行高的2.5倍以内（放宽以兼容CAD双倍行距）
                 v_gap = ny1 - curr_y2
-                if 0 <= v_gap <= max(curr_h, nh) * 1.5:
-                    # 2. 严格的左边界对齐（CAD文本列表的典型特征，容差50像素内）
-                    if abs(curr_x1 - nx1) < 50:
-                        if v_gap < best_next_gap:
-                            best_next_gap = v_gap
-                            best_next_idx = j
+                avg_h = (curr_h + nh) / 2
+                if v_gap < 0 or v_gap > avg_h * 2.5:
+                    continue
+
+                # 2. 多维度对齐判定（任意满足一个即可视为同段落）：
+                #    a) 左边界对齐（CAD多行文本最主要特征，容差60px）
+                left_aligned = abs(curr_x1 - nx1) < 60
+                #    b) 水平中心接近（处理居中或宽度变化的行，容差80px）
+                center_close = abs(curr_cx - ncx) < 80
+                #    c) 右边界对齐（处理右对齐文本块）
+                right_aligned = abs(curr_x2 - nx2) < 60
+                #    d) 水平重叠率 > 40%（处理缩进/悬挂式段落）
+                h_overlap = min(curr_x2, nx2) - max(curr_x1, nx1)
+                h_overlap_ratio = h_overlap / max(curr_x2 - curr_x1, nx2 - nx1, 1)
+
+                is_aligned = (left_aligned or center_close or right_aligned
+                              or h_overlap_ratio > 0.4)
+
+                if is_aligned and v_gap < best_next_gap:
+                    best_next_gap = v_gap
+                    best_next_idx = j
 
             if best_next_idx is not None:
                 current_block.append(horizontal_items[best_next_idx])
@@ -1830,6 +1883,9 @@ def merge_ocr_items(items: list, img_bgr=None) -> list:
 
             combined_text = "\n".join(b["text"] for b in current_block)
             avg_conf = sum(b["confidence"] for b in current_block) / len(current_block)
+            # 保留原始每行bbox，用于回填时复刻原文对齐
+            sub_bboxes = [b["bbox"] for b in current_block]
+            sub_texts = [b["text"] for b in current_block]
 
             merged_text.append({
                 "text": combined_text,
@@ -1839,8 +1895,11 @@ def merge_ocr_items(items: list, img_bgr=None) -> list:
                 "confidence": round(avg_conf, 3),
                 "width": int(bx2 - bx1),
                 "height": int(by2 - by1),
-                "is_structured": True
+                "is_structured": True,
+                "sub_bboxes": sub_bboxes,
+                "sub_texts": sub_texts,
             })
+            logger.info(f"  [段落合并] {len(current_block)}行→1块: '{combined_text[:60]}...'")
 
     final_items = merged_text + rotated_items
     if img_bgr is not None:
@@ -1967,29 +2026,26 @@ def _append_with_char_break(draw, text, font, max_width, out_lines):
 
 
 def _fit_text_to_box(draw, text, font_path, box_w, box_h, max_font_size, max_width=None):
-    """计算英文缩放比例，给予一定的横向延展缓冲防止过紧挤压。
-
-    v2.0 修复: 回退时返回真实文本高度（而非伪造box_h），并增加 overflow 标志。
+    """极限填满文本框：计算能刚好填满但绝不超出的最大字号。
 
     参数:
-        box_w: 原文 bbox 宽度（用于估算默认允许宽度 box_w*1.15）
-        box_h: 原文 bbox 高度
-        max_width: 允许绘制的硬上限（如受右页边约束）。若给出，则取
-                   min(box_w*1.15, max_width)，确保文字绝不越过该边界。
+        box_w: 允许宽度（精确约束，绝不超出）
+        box_h: 允许高度（精确约束，绝不超出）
+        max_width: 硬右边界（如受页边距约束），给出时取 min(box_w, max_width)
 
     返回: (font, lines, spacing, total_h, overflow)
-          overflow=True 表示即使最小字号也放不下（调用方可据此缩小容器或裁剪）
+          overflow=True 表示即使最小字号也放不下
     """
     min_font_size = 5
     max_font_size = max(min_font_size, max_font_size)
-    # CAD 图纸横向往往有空白，英文字符自然膨胀，允许横向适当延展15%减小字号缩减压力
-    allowed_w = max(1, int(box_w * 1.15))
+    # 极限操作：精确使用box_w，不给横向延展缓冲
+    allowed_w = max(1, box_w)
     if max_width is not None:
         allowed_w = max(1, min(allowed_w, int(max_width)))
 
     for font_size in range(max_font_size, min_font_size - 1, -1):
         font = _load_font(font_path, font_size)
-        spacing = max(1, int(font_size * 0.15))
+        spacing = max(1, int(font_size * 0.12))
         lines = _wrap_structured_text(draw, text, font, allowed_w)
 
         max_line_w = 0
@@ -2005,9 +2061,9 @@ def _fit_text_to_box(draw, text, font_path, box_w, box_h, max_font_size, max_wid
         if max_line_w <= allowed_w and total_h <= box_h:
             return font, lines, spacing, total_h, False
 
-    # v2.0: 兜底——计算真实高度而非伪造 box_h
+    # 兜底：最小字号仍溢出
     font = _load_font(font_path, min_font_size)
-    spacing = max(1, int(min_font_size * 0.15))
+    spacing = max(1, int(min_font_size * 0.12))
     lines = _wrap_structured_text(draw, text, font, allowed_w)
     real_h = 0
     for line in lines:
@@ -2146,7 +2202,7 @@ def _render_text_item_layer(item, font_path, text_color):
         local = Image.new("RGBA", (local_w, local_h), (0, 0, 0, 0))
         d = ImageDraw.Draw(local)
 
-        max_font_size = max(8, int(H * 0.82))
+        max_font_size = max(8, int(H * 0.95))
         font, lines, spacing, text_h, overflow = _fit_text_to_box(d, translated, font_path, L, H, max_font_size)
 
         ty = pad + max(0, int((H - text_h) / 2))
@@ -2175,121 +2231,52 @@ def _render_text_item_layer(item, font_path, text_color):
 
 def inpaint_and_overlay(img_path, translated_items, output_img_path):
     """
-    智能文本擦除与高保真对齐回填引擎
+    OCR合并框极限擦除与回填引擎
 
-    v2.0 优化:
-      - 单元格擦除2px内缩保护格线
-      - 格内全部文本（含未翻译）统一擦除，用原图底色
-      - 单元格多行按原文比例分配行高，硬裁剪防溢出
-      - 检测原文对齐方式并复刻
-      - success 计数后置
+    v3.0: 统一基于OCR合并文本框（而非OpenCV单元格）擦除+回填。
+    单元格检测仅在merge_ocr_items阶段用于判断哪些文本属于同一组；
+    此处所有擦除和回填均以OCR合并后的item.bbox/sub_bboxes为准。
     """
     img_bgr = cv2.imread(img_path)
     h, w = img_bgr.shape[:2]
     original_bgr = img_bgr.copy()
-    img_gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
-    h_lines, v_lines, hmask, vmask = _detect_table_lines(img_gray)
 
-    # 收集所有确实被翻译的文本项
-    translated_set = set()
-    for item in translated_items:
-        if item.get("translated", item["text"]) != item["text"]:
-            translated_set.add(id(item))
+    font_path = FONT_PATH if os.path.exists(FONT_PATH) else None
+    erase_cnt = 0
+    success = 0
+    skip = 0
 
-    # === 擦除阶段 ===
-    # 策略：
-    #  - 表格单元格内：擦除【整个单元格内部】（框线内侧留 CELL_ERASE_INSET px），
-    #    白底填充。擦除格内所有文本（含未翻译的），但保留表格框线。
-    #  - 非表格普通文本：直接白色矩形填充 bbox，干净彻底、不留中文残影。
-    cell_cnt = fill_cnt = 0
-    cells_erased = set()  # 避免同一格重复擦除
-    cells_not_erased = {}  # 跟踪为何某些格未被擦除
-
+    # === 擦除阶段：统一按OCR合并框内缩1px精确擦除 ===
     logger.info("=" * 50)
-    logger.info("[擦除阶段] 开始扫描...")
+    logger.info("[擦除阶段] 统一按OCR合并框擦除...")
 
-    for item_idx, item in enumerate(translated_items):
+    for item in translated_items:
+        translated = item.get("translated", item["text"])
+        if translated == item["text"]:
+            continue  # 未翻译的不擦除
+
         x1, y1, x2, y2 = item["bbox"]
         x1, y1 = max(0, x1), max(0, y1)
         x2, y2 = min(w - 1, x2), min(h - 1, y2)
         if x2 <= x1 or y2 <= y1:
             continue
 
-        # 优先使用预建的 cell，否则回退到 _find_table_cell
-        cell = item.get("cell")
-        if cell is None and item.get("in_table", False):
-            cell = _find_table_cell(item["bbox"], h_lines, v_lines, hmask, vmask, img_gray)
-            if cell:
-                logger.debug(f"  [擦除] OCR#{item_idx} 回退_find_table_cell成功 → {_cell_id(cell)}")
-            else:
-                logger.debug(f"  [擦除] OCR#{item_idx} in_table=True但_find_table_cell返回None，bbox=({x1},{y1})-({x2},{y2})")
-
-        if cell is not None:
-            if cell in cells_erased:
-                continue  # 已擦除
-            cl, ct, cr, cb = cell
-            cid = _cell_id(cell)
-            inset = CELL_ERASE_INSET
-            ecl = max(0, min(cl + inset, w - 1))
-            ecr = max(0, min(cr - inset, w - 1))
-            ect = max(0, min(ct + inset, h - 1))
-            ecb = max(0, min(cb - inset, h - 1))
-            if ecr > ecl and ecb > ect:
-                if ect < ecb and ecl < ecr:
-                    cell_region = original_bgr[ect:ecb, ecl:ecr]
-                    fill_color = (255, 255, 255) if float(np.mean(cell_region)) > 200 else (240, 240, 240)
-                else:
-                    fill_color = (255, 255, 255)
-                cv2.rectangle(img_bgr, (ecl, ect), (ecr, ecb), fill_color, -1)
-                cells_erased.add(cell)
-                cell_cnt += 1
-                logger.info(f"  [擦除] {cid}: 格内({ecl},{ect})-({ecr},{ecb}) {ecr-ecl}x{ecb-ect}px 填充色={fill_color}")
-            else:
-                logger.warning(f"  [擦除跳过] {cid}: 内缩后尺寸无效 ecl={ecl} ecr={ecr} ect={ect} ecb={ecb}")
-            continue
-
-        # 非单元格项：擦除时向外扩展3px，覆盖OCR漏识别的残余笔画
-        if id(item) in translated_set:
-            ex1, ey1 = max(0, x1 - 3), max(0, y1 - 3)
-            ex2, ey2 = min(w - 1, x2 + 3), min(h - 1, y2 + 3)
+        # 极限擦除：向内1px，绝不超出OCR合并框边线
+        ex1, ey1 = max(0, x1 + 1), max(0, y1 + 1)
+        ex2, ey2 = min(w - 1, x2 - 1), min(h - 1, y2 - 1)
+        if ex2 > ex1 and ey2 > ey1:
             cv2.rectangle(img_bgr, (ex1, ey1), (ex2, ey2), (255, 255, 255), -1)
-            fill_cnt += 1
-            logger.debug(f"  [擦除-普通] OCR#{item_idx} bbox({x1},{y1})-({x2},{y2}) → 扩展({ex1},{ey1})-({ex2},{ey2})")
+            erase_cnt += 1
 
-    # 报告：哪些已注册的格完全没有被擦除（可能不含OCR文本，或cell未正确传递）
-    all_registered = set(_cell_registry.keys())
-    untouched = all_registered - cells_erased
-    if untouched:
-        for cell_key in untouched:
-            cid = _cell_registry[cell_key]
-            logger.warning(f"  [擦除遗漏] {cid}: 注册但未被擦除！坐标({cell_key[0]},{cell_key[1]})-({cell_key[2]},{cell_key[3]})")
-    logger.info(f"  [擦除汇总] 单元格擦除: {cell_cnt}/{len(all_registered)} 格 | 普通填充: {fill_cnt} 块 | 遗漏: {len(untouched)} 格")
+    logger.info(f"  [擦除汇总] 共擦除 {erase_cnt} 个OCR合并框")
 
-    # === v2.2: 合并嵌套/重叠单元格（修复同格多检，如Cell_003+004） ===
-    cell_remap = _merge_nested_cells()
-
-    # v2.2: 更新所有item.cell引用（被合并的旧格→新keeper格）
-    if cell_remap:
-        for item in translated_items:
-            old_cell = item.get("cell")
-            if old_cell is not None and old_cell in cell_remap:
-                item["cell"] = cell_remap[old_cell]
-                logger.debug(f"  [cell更新] item '{item['text'][:30]}' cell {_cell_registry.get(old_cell, '?')} → {_cell_registry.get(cell_remap[old_cell], '?')}")
-
+    # === 回填阶段：统一按OCR合并框渲染 ===
     pil_img = Image.fromarray(cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)).convert("RGBA")
     draw = ImageDraw.Draw(pil_img)
 
-    font_path = FONT_PATH if os.path.exists(FONT_PATH) else None
-
-    # === v2.2: 先构建 cell→items 映射，再按格分组渲染（解决同格多OCR重叠） ===
-    cell_items_map = {}  # cell_key -> [item, ...]
-    non_cell_items = []
-    success = skip = 0
-
     for item in translated_items:
         translated = item.get("translated", item["text"])
-        original = item["text"]
-        if translated == original:
+        if translated == item["text"]:
             skip += 1
             continue
 
@@ -2299,31 +2286,57 @@ def inpaint_and_overlay(img_path, translated_items, output_img_path):
             skip += 1
             continue
 
+        text_color = _sample_text_color(original_bgr, x1, y1, x2, y2)
         angle = float(item.get("angle", 0.0))
-        if abs(angle) < ANGLE_NEAR_HORIZONTAL and bool(item.get("in_table", False)):
-            cell = item.get("cell")
-            if cell is None:
-                cell = _find_table_cell(item["bbox"], h_lines, v_lines, hmask, vmask, img_gray)
-                item["cell"] = cell
-                if cell is not None:
-                    _register_text_in_cell(cell, -1, original, translated)
-            if cell is not None:
-                cell_items_map.setdefault(cell, []).append(item)
-                continue
-        non_cell_items.append(item)
 
-    # 渲染非单元格项（原有逻辑）
-    for item in non_cell_items:
-        _render_single_item(item, draw, pil_img, original_bgr, font_path, w, h, success, skip)
+        # 旋转文本：使用独立图层渲染
+        if abs(angle) >= ANGLE_NEAR_HORIZONTAL:
+            try:
+                layer, left, top = _render_text_item_layer(item, font_path, text_color)
+                _alpha_composite_at(pil_img, layer, left, top)
+                success += 1
+            except Exception:
+                skip += 1
+            continue
 
-    # 渲染单元格项：按格分组，多行统一渲染
-    for cell_key, items in cell_items_map.items():
-        _render_cell_group(cell_key, items, draw, pil_img, original_bgr, font_path)
+        # 水平文本：按sub_bboxes逐行渲染，保留原文对齐
+        sub_bboxes = item.get("sub_bboxes", [])
+        src_lines = translated.split("\n")
+
+        if sub_bboxes and len(sub_bboxes) == len(src_lines):
+            # 多行：逐行按原文sub_bbox位置回填
+            for k, ln in enumerate(src_lines):
+                sb = sub_bboxes[k]
+                sx1, sy1, sx2, sy2 = sb
+                srow_w = max(1, sx2 - sx1)
+                srow_h = max(1, sy2 - sy1)
+                line_max_w = max(1, (w - RIGHT_MARGIN) - (sx1 + 1))
+                fnt, flines, fsp, fth, _ = _fit_text_to_box(
+                    draw, ln, font_path, srow_w, srow_h,
+                    max(8, int(srow_h * 0.95)), max_width=line_max_w)
+                ly = sy1 + max(0, int((srow_h - fth) / 2))
+                for sub_line in flines:
+                    draw.text((sx1 + 1, ly), sub_line, fill=text_color + (255,), font=fnt)
+                    sb2 = draw.textbbox((0, 0), sub_line if sub_line else " ", font=fnt)
+                    ly += (sb2[3] - sb2[1]) + fsp
+        else:
+            # 单行：填满整个合并框
+            max_font_size = max(8, int(box_h * 0.95))
+            max_width_edge = max(1, (w - RIGHT_MARGIN) - (x1 + 1))
+            font, lines, spacing, text_h, _ = _fit_text_to_box(
+                draw, translated, font_path, box_w, box_h,
+                max_font_size, max_width=max_width_edge)
+            ty = y1 + max(0, int((box_h - text_h) / 2)) if len(lines) == 1 else y1 + 1
+            y_cursor = ty
+            for line in lines:
+                draw.text((x1 + 1, y_cursor), line, fill=text_color + (255,), font=font)
+                lb = draw.textbbox((0, 0), line if line else " ", font=font)
+                y_cursor += (lb[3] - lb[1]) + spacing
+
         success += 1
 
-
     pil_img.convert("RGB").save(output_img_path)
-    print(f"  版面回填完成: 成功渲染 {success} 块, 忽略/跳过 {skip} 块")
+    logger.info(f"  [回填汇总] 成功渲染 {success} 块, 跳过 {skip} 块")
     return translated_items
 
 
@@ -2342,66 +2355,39 @@ def _render_single_item(item, draw, pil_img, original_bgr, font_path, w, h, succ
     max_width_edge = max(1, (w - RIGHT_MARGIN) - (x1 + 2))
 
     if abs(angle) < ANGLE_NEAR_HORIZONTAL:
-        tx = x1 + 2
+        tx = x1 + 1  # 极限靠左，仅留1px呼吸空间
         if item.get("is_structured", False):
             src_lines = [ln for ln in translated.split("\n")]
             n = max(1, len(src_lines))
-            row_h = box_h / n
-            y_cursor = y1 + 1
-            min_fs = 5
-            max_fs = max(8, int(row_h * 0.85))
-            common_font = None
-            common_wrap = []
-            for fs in range(max_fs, min_fs - 1, -1):
-                try:
-                    test_font = _load_font(font_path, fs)
-                except Exception:
-                    continue
-                ok = True
-                wraps = []
-                for ln in src_lines:
-                    wlines = _wrap_structured_text(draw, ln, test_font, max_width_edge)
-                    max_lw = 0
-                    for wl in wlines:
-                        wb = draw.textbbox((0, 0), wl if wl else " ", font=test_font)
-                        max_lw = max(max_lw, wb[2] - wb[0])
-                    if max_lw > max_width_edge:
-                        ok = False
-                        break
-                    spacing = max(1, int(fs * 0.15))
-                    lh_total = sum((draw.textbbox((0, 0), wl if wl else " ", font=test_font)[3] -
-                                    draw.textbbox((0, 0), wl if wl else " ", font=test_font)[1] + spacing)
-                                   for wl in wlines)
-                    if lh_total > row_h:
-                        ok = False
-                        break
-                    wraps.append((test_font, wlines, spacing, lh_total))
-                if ok:
-                    common_font = test_font
-                    common_wrap = wraps
-                    break
-            if common_wrap:
-                for (fnt, flines, fsp, fth) in common_wrap:
-                    ly = y_cursor + max(0, int((row_h - fth) / 2))
-                    for sub in flines:
-                        draw.text((tx, ly), sub, fill=text_color + (255,), font=fnt)
-                        sb = draw.textbbox((0, 0), sub if sub else " ", font=fnt)
-                        ly += (sb[3] - sb[1]) + fsp
-                    y_cursor += row_h
-                return success + 1, skip
+            # 使用原始每行bbox计算行高（如果保留），否则等分
+            sub_bboxes = item.get("sub_bboxes", [])
+            if sub_bboxes and len(sub_bboxes) == n:
+                orig_heights = [sb[3] - sb[1] for sb in sub_bboxes]
+                orig_x1s = [sb[0] for sb in sub_bboxes]
             else:
-                for ln in src_lines:
-                    fnt, flines, fsp, fth, _ = _fit_text_to_box(
-                        draw, ln, font_path, box_w, row_h, max(8, int(row_h * 0.85)), max_width=max_width_edge)
-                    ly = y_cursor + max(0, int((row_h - fth) / 2))
-                    for sub in flines:
-                        draw.text((tx, ly), sub, fill=text_color + (255,), font=fnt)
-                        sb = draw.textbbox((0, 0), sub if sub else " ", font=fnt)
-                        ly += (sb[3] - sb[1]) + fsp
-                    y_cursor += row_h
-                return success + 1, skip
+                orig_heights = [box_h / n] * n
+                orig_x1s = [x1] * n
+            total_orig_h = sum(orig_heights)
+            row_heights = [max(1, box_h * oh / total_orig_h) for oh in orig_heights] if total_orig_h > 0 else [box_h / n] * n
+
+            y_cursor = y1
+            for k, ln in enumerate(src_lines):
+                rh = row_heights[k]
+                # 使用原文x1作为对齐基准
+                line_x1 = orig_x1s[k] if k < len(orig_x1s) else x1
+                line_tx = line_x1 + 1
+                line_max_w = max(1, (w - RIGHT_MARGIN) - line_tx)
+                fnt, flines, fsp, fth, _ = _fit_text_to_box(
+                    draw, ln, font_path, box_w, rh, max(8, int(rh * 0.95)), max_width=line_max_w)
+                ly = y_cursor + max(0, int((rh - fth) / 2))
+                for sub in flines:
+                    draw.text((line_tx, ly), sub, fill=text_color + (255,), font=fnt)
+                    sb = draw.textbbox((0, 0), sub if sub else " ", font=fnt)
+                    ly += (sb[3] - sb[1]) + fsp
+                y_cursor += rh
+            return success + 1, skip
         else:
-            max_font_size = max(8, int(box_h * 0.85))
+            max_font_size = max(8, int(box_h * 0.95))
             font, lines, spacing, text_h, _ = _fit_text_to_box(
                 draw, translated, font_path, box_w, box_h, max_font_size, max_width=max_width_edge)
             ty = y1 + max(0, int((box_h - text_h) / 2)) if len(lines) == 1 else y1 + 2
@@ -2446,9 +2432,11 @@ def _render_cell_group(cell_key, items, draw, pil_img, original_bgr, font_path):
     else:
         row_heights = [layer_h / n] * n
 
-    # 取第一个item的X起始位置
-    tx = items_sorted[0]["bbox"][0] + 2
-    local_tx = max(0, tx - inner_cl)
+    # 记录每行原文X起始位置，用于复刻对齐
+    orig_x1s = [it["bbox"][0] for it in items_sorted]
+    # 以最左的原文x1为基准
+    base_tx = min(orig_x1s) + 1
+    local_tx = max(0, base_tx - inner_cl)
     local_draw_w = max(1, layer_w - local_tx)
 
     # 检测对齐方式（用第一个item）
@@ -2457,41 +2445,51 @@ def _render_cell_group(cell_key, items, draw, pil_img, original_bgr, font_path):
     logger.info(f"  [渲染组] {cid}: {n}个OCR项, 格内={layer_w}x{layer_h}px, 对齐={alignment}, "
                 f"行高={[round(rh,1) for rh in row_heights]}px")
 
-    # 统一字号搜索
+    # 统一字号搜索：每行使用自己的可用宽度（基于原文x1偏移）
     row_fonts = []
+    row_lx_offsets = []  # 每行的x偏移（相对于图层）
     unified_fs = None
-    min_fs, max_fs = 5, max(8, int(min(row_heights) * 0.85))
+    min_fs, max_fs = 5, max(8, int(min(row_heights) * 0.95))
     for fs in range(int(max_fs), min_fs - 1, -1):
         try_font = _load_font(font_path, fs)
         all_fit = True
         temp_wraps = []
+        temp_offsets = []
         for k, ln in enumerate(src_lines):
             rh = row_heights[k]
-            try_spacing = max(1, int(fs * 0.15))
-            try_lines = _wrap_structured_text(draw, ln, try_font, local_draw_w)
+            # 每行使用自己的原文x1作为起点
+            row_local_tx = max(0, orig_x1s[k] + 1 - inner_cl)
+            row_draw_w = max(1, layer_w - row_local_tx)
+            try_spacing = max(1, int(fs * 0.12))
+            try_lines = _wrap_structured_text(draw, ln, try_font, row_draw_w)
             try_h = 0
             for tl in try_lines:
                 tb = draw.textbbox((0, 0), tl if tl else " ", font=try_font)
                 try_h += (tb[3] - tb[1])
             if len(try_lines) > 1:
                 try_h += try_spacing * (len(try_lines) - 1)
-            if try_h > rh * 1.05:
+            if try_h > rh:
                 all_fit = False
-                logger.debug(f"    {cid} 行{k} 字号{fs} 溢出: {try_h:.1f}>{rh*1.05:.1f} 文本='{ln[:30]}'")
+                logger.debug(f"    {cid} 行{k} 字号{fs} 溢出: {try_h:.1f}>{rh:.1f} 文本='{ln[:30]}'")
                 break
             temp_wraps.append((try_font, try_lines, try_spacing, try_h))
+            temp_offsets.append(row_local_tx)
         if all_fit:
             unified_fs = fs
             row_fonts = temp_wraps
+            row_lx_offsets = temp_offsets
             break
 
     if not row_fonts:
         logger.warning(f"  [渲染组回退] {cid}: 无统一字号, 改用逐行独立字号")
         for k, ln in enumerate(src_lines):
             rh = row_heights[k]
+            row_local_tx = max(0, orig_x1s[k] + 1 - inner_cl)
+            row_draw_w = max(1, layer_w - row_local_tx)
             fnt, flines, fsp, fth, overflow = _fit_text_to_box(
-                draw, ln, font_path, local_draw_w, rh, max(8, int(rh * 0.82)), max_width=local_draw_w)
+                draw, ln, font_path, row_draw_w, rh, max(8, int(rh * 0.95)), max_width=row_draw_w)
             row_fonts.append((fnt, flines, fsp, fth))
+            row_lx_offsets.append(row_local_tx)
             if overflow:
                 logger.warning(f"    {cid} 行{k} 最小字号仍溢出! rh={rh:.0f}px h={fth:.0f}px '{ln[:40]}'")
     else:
@@ -2506,15 +2504,17 @@ def _render_cell_group(cell_key, items, draw, pil_img, original_bgr, font_path):
         rh = row_heights[k]
         ly = y_cursor + max(0, int((rh - fth) / 2))
         it_color = _sample_text_color(original_bgr, *items_sorted[k]["bbox"])
+        lx_offset = row_lx_offsets[k] if k < len(row_lx_offsets) else local_tx
+        row_draw_w = max(1, layer_w - lx_offset)
         for sub in flines:
             sub_bbox = layer_draw.textbbox((0, 0), sub if sub else " ", font=fnt)
             sub_w = sub_bbox[2] - sub_bbox[0]
             if alignment == "center":
-                lx = local_tx + max(0, int((local_draw_w - sub_w) / 2))
+                lx = lx_offset + max(0, int((row_draw_w - sub_w) / 2))
             elif alignment == "right":
-                lx = local_tx + max(0, local_draw_w - sub_w)
+                lx = lx_offset + max(0, row_draw_w - sub_w)
             else:
-                lx = local_tx
+                lx = lx_offset
             layer_draw.text((lx, ly), sub, fill=it_color + (255,), font=fnt)
             ly += (layer_draw.textbbox((0, 0), sub if sub else " ", font=fnt)[3] -
                    layer_draw.textbbox((0, 0), sub if sub else " ", font=fnt)[1]) + fsp
@@ -2719,6 +2719,10 @@ def main():
     ocr_json = os.path.join(WORK_DIR, "ocr_result.json")
     with open(ocr_json, "w", encoding="utf-8") as f:
         json.dump(ocr_items, f, ensure_ascii=False, indent=2)
+
+    print("\n[Step 2.6] Generate Merged OCR Debug PDF (post-merge bounding boxes)...")
+    ocr_merged_debug_pdf = os.path.join(WORK_DIR, "ocr_debug_merged.pdf")
+    _generate_debug_ocr_pdf(img_path, ocr_items, ocr_merged_debug_pdf, dpi=page_meta["dpi"])
 
     print(f"\n[Step 3] Translate ({TRANSLATE_ENGINE} engine via Custom Tagged Protocol)...")
     if TRANSLATE_ENGINE == "llm":

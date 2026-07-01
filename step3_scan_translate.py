@@ -66,13 +66,13 @@ def translate_with_llm(text_items: list) -> list:
     )
 
     system_prompt = f"""你是一名专业的机械/电气工程翻译专家，精通ISO/DIN/GB标准术语。
-请将CAD图纸中的中文文本翻译为英文。要求：
+请将CAD图纸中的中文文本翻译为英文。核心要求：极简短！
 1. 使用国际通用的工程标准术语（ISO/DIN标准）
-2. 必须简短！使用缩写（如Int.代替Intermediate，Mat'l代替Material，Req.代替Requirements）
-3. 保持专业性和准确性
-4. 如果文本包含数字、代号、字母等非中文字符，保留原样只翻译中文部分
+2. 极限简短！目标1-3词，尽量用缩写（Int., Mat'l, Req., Thk., DWG, Qty., Dia., Lgth., No., Grd., Dim., Tol., Surf., Ass'y, Req'd, Min., Max., Ref., Spec., Sec., Grnd., Fdn., Elev., Horiz., Vert., w/, w/o）
+3. 多词短语缩写每个词："表面粗糙度" → "Surf. Rough."
+4. 保留数字、代号、字母等非中文字符
 5. 仅输出翻译结果，每行格式: 序号. 译文
-6. 短语翻译控制在3个单词以内
+6. 表格单元格、标注：1-2个缩写词
 
 常用术语参考:
 {dict_sample}"""
