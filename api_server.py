@@ -1,8 +1,10 @@
 """
-PDF Translate API Server - CAD 图纸中文→英文翻译 + 双方法对比
+PDF Translate API Server - CAD 图纸中文→英文翻译
 
-提供 Swagger UI 界面上传 PDF，自动完成 OCR→翻译→回填全流程，
-同时产出 OCR合并框 和 OpenCV单元格 两种回填结果用于对比。
+自动检测 PDF 类型（矢量型 / 扫描型），路由到对应管线完成翻译→回填全流程。
+
+- 矢量型 PDF：PyMuPDF 提取文本 → LLM/字典翻译 → 原位白底擦除+回填英文
+- 扫描型 PDF：OCR → 翻译 → OCR合并框 / OpenCV单元格 双方法回填对比
 
 启动: conda run -n modelscope uvicorn api_server:app --host 0.0.0.0 --port 8000
 访问: http://localhost:8000/docs
@@ -17,37 +19,56 @@ from fastapi.responses import FileResponse, HTMLResponse
 from loguru import logger
 import uvicorn
 import cv2
+import fitz as fitz_standalone  # 用于 PDF 类型检测
 import config
 
 # 配置 logger（FastAPI 上下文，控制台输出）
 logger.remove()
 logger.add(sys.stdout, level="DEBUG", format="<green>{time:HH:mm:ss}</green> | <level>{level: <8}</level> | <level>{message}</level>")
 
-# ── 导入核心 pipeline 函数 ──────────────────────────────────
-# 主脚本文件名含连字符，需要用 importlib 导入
+# ── 导入扫描型 pipeline（OCR 路线）──────────────────────────
 import importlib.util
 
 _base = os.path.dirname(os.path.abspath(__file__))
-_main_path = os.path.join(_base, "scan_translate_layout_fixed_gemini-code.py")
-_spec = importlib.util.spec_from_file_location("pipeline", _main_path)
-pipeline = importlib.util.module_from_spec(_spec)
-sys.modules["pipeline"] = pipeline
-_spec.loader.exec_module(pipeline)
 
-# 重新导出常用符号
-pdf_to_image           = pipeline.pdf_to_image
-ocr_with_rapid_chunked = pipeline.ocr_with_rapid_chunked
-merge_ocr_items        = pipeline.merge_ocr_items
-translate_with_llm     = pipeline.translate_with_llm
-translate_with_dictionary = pipeline.translate_with_dictionary
-inpaint_and_overlay    = pipeline.inpaint_and_overlay
-_inpaint_overlay_cell_based = pipeline._inpaint_overlay_cell_based
-_generate_debug_ocr_pdf    = pipeline._generate_debug_ocr_pdf
-_generate_debug_cell_pdf   = pipeline._generate_debug_cell_pdf
-image_to_pdf           = pipeline.image_to_pdf
-_clear_cell_registry   = pipeline._clear_cell_registry
-TRANSLATE_ENGINE       = pipeline.TRANSLATE_ENGINE
-CHUNK_SIZE             = pipeline.CHUNK_SIZE
+# scan pipeline
+_scan_path = os.path.join(_base, "scan_translate_pipeline.py")
+_scan_spec = importlib.util.spec_from_file_location("scan_pipeline", _scan_path)
+scan_pipeline = importlib.util.module_from_spec(_scan_spec)
+sys.modules["scan_pipeline"] = scan_pipeline
+_scan_spec.loader.exec_module(scan_pipeline)
+
+# 扫描管线符号
+_scan_pdf_to_image           = scan_pipeline.pdf_to_image
+_scan_ocr_with_rapid_chunked = scan_pipeline.ocr_with_rapid_chunked
+_scan_merge_ocr_items        = scan_pipeline.merge_ocr_items
+_scan_translate_with_llm     = scan_pipeline.translate_with_llm
+_scan_translate_with_dictionary = scan_pipeline.translate_with_dictionary
+_scan_inpaint_and_overlay    = scan_pipeline.inpaint_and_overlay
+_scan_inpaint_overlay_cell_based = scan_pipeline._inpaint_overlay_cell_based
+_scan_generate_debug_ocr_pdf    = scan_pipeline._generate_debug_ocr_pdf
+_scan_generate_debug_cell_pdf   = scan_pipeline._generate_debug_cell_pdf
+_scan_image_to_pdf           = scan_pipeline.image_to_pdf
+_scan_clear_cell_registry    = scan_pipeline._clear_cell_registry
+SCAN_CHUNK_SIZE              = scan_pipeline.CHUNK_SIZE
+
+# vector pipeline
+_vector_path = os.path.join(_base, "vector_translate_pipeline.py")
+_vector_spec = importlib.util.spec_from_file_location("vector_pipeline", _vector_path)
+vector_pipeline = importlib.util.module_from_spec(_vector_spec)
+sys.modules["vector_pipeline"] = vector_pipeline
+_vector_spec.loader.exec_module(vector_pipeline)
+
+# 矢量管线符号
+_vector_extract_text_info     = vector_pipeline.extract_text_info
+_vector_translate_with_llm    = vector_pipeline.translate_with_llm
+_vector_translate_with_dictionary = vector_pipeline.translate_with_dictionary
+_vector_trim_vertical         = vector_pipeline.trim_vertical_translations
+_vector_redact_and_refill     = vector_pipeline.redact_and_refill
+_vector_has_chinese           = vector_pipeline.has_chinese
+_vector_generate_report       = vector_pipeline.generate_vector_report
+
+TRANSLATE_ENGINE = config.TRANSLATE_ENGINE
 
 # ── 应用初始化 ──────────────────────────────────────────────
 app = FastAPI(
@@ -56,18 +77,17 @@ app = FastAPI(
 ## CAD 图纸 PDF 中文→英文翻译服务
 
 ### 功能
-- 上传 PDF 文件，自动完成 OCR → 翻译 → 回填全流程
-- 同时生成两种回填结果用于对比：
-  - **OCR Box Method**: 按 OCR 合并文本框回填（推荐）
-  - **Cell-Based Method**: 按 OpenCV 单元格回填（对照组）
+- 上传 PDF 文件，**自动检测类型**（矢量型 / 扫描型），择最优管线处理
+- **矢量型 PDF**：直接提取矢量文本 → LLM/字典翻译 → 原位擦除+回填（保留字号/颜色/方向）
+- **扫描型 PDF**：OCR 识别 → 翻译 → 双方法回填对比（OCR合并框 / OpenCV单元格）
 
 ### 使用方法
-1. `POST /api/upload` — 上传 PDF
+1. `POST /api/upload` — 上传 PDF（自动检测类型）
 2. `POST /api/process/{task_id}` — 启动处理
 3. `GET /api/status/{task_id}` — 查看进度
 4. `GET /api/download/{task_id}/{filename}` — 下载结果
 """,
-    version="1.0.0",
+    version="2.0.0",
 )
 
 # 任务存储目录
@@ -79,36 +99,67 @@ TASKS_DIR.mkdir(exist_ok=True)
 tasks: dict = {}
 
 
-# ── 辅助函数 ────────────────────────────────────────────────
-def _run_pipeline(pdf_path: str, work_dir: str, task_id: str):
-    """在后台运行完整翻译管线。"""
+# ══════════════════════════════════════════════════════════════
+# PDF 类型检测
+# ══════════════════════════════════════════════════════════════
+
+def detect_pdf_type(pdf_path: str) -> str:
+    """
+    检测 PDF 为矢量型（含可提取的中文文本）还是扫描型（图片）。
+    抽样检查前 3 页，任一页提取到中文即判定为矢量型。
+
+    Returns:
+        "vector" — 矢量型，有可选择/可复制的矢量中文文本
+        "scan"   — 扫描型，需要 OCR 处理
+    """
+    doc = fitz_standalone.open(pdf_path)
+    try:
+        pages_to_check = min(doc.page_count, 3)
+        for page_idx in range(pages_to_check):
+            page = doc[page_idx]
+            text = page.get_text("text")
+            if _vector_has_chinese(text):
+                logger.info(f"[Detect] 第 {page_idx + 1} 页发现中文矢量文本 → 矢量型 PDF")
+                return "vector"
+        logger.info(f"[Detect] 前 {pages_to_check} 页无中文矢量文本 → 扫描型 PDF")
+        return "scan"
+    finally:
+        doc.close()
+
+
+# ══════════════════════════════════════════════════════════════
+# 后台管线
+# ══════════════════════════════════════════════════════════════
+
+def _run_scan_pipeline(pdf_path: str, work_dir: str, task_id: str):
+    """在后台运行扫描型 PDF 翻译管线（OCR 路线 + 双方法对比）。"""
     task = tasks.get(task_id)
     if not task:
         return
     task["status"] = "processing"
-    task["progress"] = "初始化..."
+    task["progress"] = "初始化扫描管线..."
 
     try:
         dpi = config.RENDER_DPI
 
         # Step 1: 渲染
         task["progress"] = "渲染PDF为图像..."
-        img_path, page_meta = pdf_to_image(pdf_path, dpi=dpi)
+        img_path, page_meta = _scan_pdf_to_image(pdf_path, dpi=dpi)
 
         # Step 2: OCR
         task["progress"] = "RapidOCR 识别..."
-        raw_ocr_items = ocr_with_rapid_chunked(img_path, chunk_size=CHUNK_SIZE)
+        raw_ocr_items = _scan_ocr_with_rapid_chunked(img_path, chunk_size=SCAN_CHUNK_SIZE)
         task["ocr_count"] = len(raw_ocr_items)
 
         # Step 2.1: OCR调试PDF
         task["progress"] = "生成OCR调试PDF..."
         ocr_debug_pdf = os.path.join(work_dir, "ocr_debug.pdf")
-        _generate_debug_ocr_pdf(img_path, raw_ocr_items, ocr_debug_pdf, dpi=dpi)
+        _scan_generate_debug_ocr_pdf(img_path, raw_ocr_items, ocr_debug_pdf, dpi=dpi)
 
         # Step 2.5: 合并
         task["progress"] = "智能文本块合并..."
         merge_img = cv2.imread(img_path)
-        ocr_items = merge_ocr_items(raw_ocr_items, img_bgr=merge_img)
+        ocr_items = _scan_merge_ocr_items(raw_ocr_items, img_bgr=merge_img)
 
         ocr_json = os.path.join(work_dir, "ocr_result.json")
         with open(ocr_json, "w", encoding="utf-8") as f:
@@ -116,14 +167,14 @@ def _run_pipeline(pdf_path: str, work_dir: str, task_id: str):
 
         # Step 2.6: 合并后OCR调试PDF
         ocr_merged_debug_pdf = os.path.join(work_dir, "ocr_debug_merged.pdf")
-        _generate_debug_ocr_pdf(img_path, ocr_items, ocr_merged_debug_pdf, dpi=dpi)
+        _scan_generate_debug_ocr_pdf(img_path, ocr_items, ocr_merged_debug_pdf, dpi=dpi)
 
         # Step 3: 翻译
         task["progress"] = "翻译中..."
         if TRANSLATE_ENGINE == "llm":
-            translated_items = translate_with_llm(ocr_items)
+            translated_items = _scan_translate_with_llm(ocr_items)
         else:
-            translated_items = translate_with_dictionary(ocr_items)
+            translated_items = _scan_translate_with_dictionary(ocr_items)
 
         trans_json = os.path.join(work_dir, "translation_mapping.json")
         with open(trans_json, "w", encoding="utf-8") as f:
@@ -135,21 +186,21 @@ def _run_pipeline(pdf_path: str, work_dir: str, task_id: str):
         # Step 4: OCR Box 方法回填（主输出）
         task["progress"] = "OCR Box 方法回填..."
         output_img = os.path.join(work_dir, "translated_page.png")
-        inpaint_and_overlay(img_path, translated_items, output_img)
+        _scan_inpaint_and_overlay(img_path, translated_items, output_img)
         output_pdf = os.path.join(work_dir, "output_ocr_box.pdf")
-        image_to_pdf(output_img, output_pdf, dpi=dpi)
+        _scan_image_to_pdf(output_img, output_pdf, dpi=dpi)
 
         # Step 5: Cell-Based 方法回填（对比输出）
         task["progress"] = "Cell-Based 方法回填..."
         output_cell_img = os.path.join(work_dir, "translated_page_cell_based.png")
-        _inpaint_overlay_cell_based(img_path, translated_items, output_cell_img)
+        _scan_inpaint_overlay_cell_based(img_path, translated_items, output_cell_img)
         output_cell_pdf = os.path.join(work_dir, "output_cell_based.pdf")
-        image_to_pdf(output_cell_img, output_cell_pdf, dpi=dpi)
+        _scan_image_to_pdf(output_cell_img, output_cell_pdf, dpi=dpi)
 
         # Cell debug PDF
         task["progress"] = "生成Cell调试PDF..."
         cell_debug_pdf = os.path.join(work_dir, "cell_debug.pdf")
-        _generate_debug_cell_pdf(output_img, cell_debug_pdf, dpi=dpi)
+        _scan_generate_debug_cell_pdf(output_img, cell_debug_pdf, dpi=dpi)
 
         # 收集结果文件
         task["result_files"] = {
@@ -189,7 +240,7 @@ def _run_pipeline(pdf_path: str, work_dir: str, task_id: str):
 
         # 生成对比报告
         compare_report = os.path.join(work_dir, "comparison_report.md")
-        _generate_comparison_report(compare_report, task)
+        _generate_scan_comparison_report(compare_report, task)
         task["result_files"]["comparison_report.md"] = {
             "path": compare_report,
             "description": "双方法对比报告",
@@ -205,12 +256,116 @@ def _run_pipeline(pdf_path: str, work_dir: str, task_id: str):
         task["traceback"] = traceback.format_exc()
 
 
-def _generate_comparison_report(report_path: str, task: dict):
-    """生成两种方法的对比报告。"""
+def _run_vector_pipeline(pdf_path: str, work_dir: str, task_id: str):
+    """在后台运行矢量型 PDF 翻译管线（PyMuPDF 提取 + 原位擦除回填）。"""
+    task = tasks.get(task_id)
+    if not task:
+        return
+    task["status"] = "processing"
+    task["progress"] = "初始化矢量管线..."
+
+    try:
+        # Step 1: 提取矢量文本
+        task["progress"] = "提取矢量中文文本..."
+        text_items = _vector_extract_text_info(pdf_path)
+        task["text_count"] = len(text_items)
+
+        extracted_json = os.path.join(work_dir, "extracted_text.json")
+        with open(extracted_json, "w", encoding="utf-8") as f:
+            json.dump(text_items, f, ensure_ascii=False, indent=2)
+
+        if not text_items:
+            task["status"] = "completed"
+            task["progress"] = "完成（无中文文本）"
+            task["result_files"] = {
+                "extracted_text.json": {
+                    "path": extracted_json,
+                    "description": "提取结果（无中文文本）",
+                },
+            }
+            task["translated_count"] = 0
+            return
+
+        # Step 2: 翻译
+        task["progress"] = "翻译中..."
+        if TRANSLATE_ENGINE == "llm":
+            translated_items = _vector_translate_with_llm(text_items)
+        else:
+            translated_items = _vector_translate_with_dictionary(text_items)
+
+        translated_items = _vector_trim_vertical(translated_items)
+
+        translation_json = os.path.join(work_dir, "translation_mapping.json")
+        with open(translation_json, "w", encoding="utf-8") as f:
+            json.dump(translated_items, f, ensure_ascii=False, indent=2)
+
+        translated_count = sum(
+            1 for item in translated_items
+            if item.get("translated", item["text"]) != item["text"]
+        )
+        task["translated_count"] = translated_count
+
+        # Step 3: 擦除 + 回填
+        task["progress"] = "原位擦除+回填英文..."
+        output_pdf = os.path.join(work_dir, "output_vector.pdf")
+        stats = _vector_redact_and_refill(
+            pdf_path=pdf_path,
+            output_path=output_pdf,
+            text_items=translated_items,
+        )
+
+        # 收集结果文件
+        task["result_files"] = {
+            "output_vector.pdf": {
+                "path": output_pdf,
+                "description": "主输出 - 矢量PDF翻译结果（推荐）",
+            },
+            "extracted_text.json": {
+                "path": extracted_json,
+                "description": "提取到的中文矢量文本+坐标",
+            },
+            "translation_mapping.json": {
+                "path": translation_json,
+                "description": "翻译映射JSON",
+            },
+        }
+
+        # 生成报告
+        report_path = os.path.join(work_dir, "vector_report.md")
+        task_info = {
+            "input_pdf": pdf_path,
+            "text_count": len(text_items),
+            "translated_count": translated_count,
+            "stats": stats,
+        }
+        _vector_generate_report(report_path, task_info)
+        task["result_files"]["vector_report.md"] = {
+            "path": report_path,
+            "description": "矢量管线处理报告",
+        }
+
+        task["status"] = "completed"
+        task["progress"] = "完成"
+        task["stats"] = stats
+
+    except Exception as e:
+        import traceback
+        task["status"] = "failed"
+        task["error"] = str(e)
+        task["traceback"] = traceback.format_exc()
+
+
+# ══════════════════════════════════════════════════════════════
+# 报告生成
+# ══════════════════════════════════════════════════════════════
+
+def _generate_scan_comparison_report(report_path: str, task: dict):
+    """生成扫描型管线双方法对比报告。"""
     lines = [
-        "# PDF Translate - 双方法对比报告",
+        "# PDF Translate - 扫描型双方法对比报告",
         "",
         f"**处理时间**: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+        f"**PDF类型**: scan",
         f"**OCR识别块数**: {task.get('ocr_count', 'N/A')}",
         f"**翻译块数**: {task.get('translated_count', 'N/A')}",
         "",
@@ -253,7 +408,7 @@ async def root():
     <head><title>PDF Translate API</title></head>
     <body>
     <h1>PDF Translate API</h1>
-    <p>CAD 图纸中文→英文翻译服务</p>
+    <p>CAD 图纸中文→英文翻译服务（自动识别矢量/扫描类型）</p>
     <ul>
       <li><a href="/docs">/docs</a> — Swagger UI</li>
       <li><a href="/redoc">/redoc</a> — ReDoc</li>
@@ -264,8 +419,8 @@ async def root():
 
 
 @app.post("/api/upload")
-async def upload_pdf(file: UploadFile = File(..., description="要翻译的 PDF 文件（CAD 图纸）")):
-    """上传 PDF 文件，返回任务 ID。"""
+async def upload_pdf(file: UploadFile = File(..., description="要翻译的 PDF 文件（CAD 图纸，自动识别矢量/扫描类型）")):
+    """上传 PDF 文件，自动检测类型，返回任务 ID 和 PDF 类型。"""
     safe_filename = Path(file.filename).name  # 防路径遍历：仅取文件名
     if not safe_filename or not safe_filename.lower().endswith(".pdf"):
         raise HTTPException(400, "只接受 PDF 文件")
@@ -279,11 +434,15 @@ async def upload_pdf(file: UploadFile = File(..., description="要翻译的 PDF 
         content = await file.read()
         f.write(content)
 
+    # 自动检测 PDF 类型
+    pdf_type = detect_pdf_type(str(pdf_path))
+
     tasks[task_id] = {
         "task_id": task_id,
         "filename": file.filename,
         "pdf_path": str(pdf_path),
         "work_dir": str(task_dir),
+        "pdf_type": pdf_type,
         "status": "uploaded",
         "progress": "等待处理",
         "created_at": datetime.now().isoformat(),
@@ -292,14 +451,15 @@ async def upload_pdf(file: UploadFile = File(..., description="要翻译的 PDF 
     return {
         "task_id": task_id,
         "filename": file.filename,
+        "pdf_type": pdf_type,
         "status": "uploaded",
-        "message": "文件已上传，请调用 /api/process/{task_id} 开始处理",
+        "message": f"文件已上传，检测为 **{pdf_type}** 型 PDF。请调用 /api/process/{task_id} 开始处理",
     }
 
 
 @app.post("/api/process/{task_id}")
 async def process_task(task_id: str, background_tasks: BackgroundTasks):
-    """启动后台处理管线。"""
+    """启动后台处理管线（根据 PDF 类型自动路由）。"""
     task = tasks.get(task_id)
     if not task:
         raise HTTPException(404, "任务不存在，请先上传文件")
@@ -307,23 +467,27 @@ async def process_task(task_id: str, background_tasks: BackgroundTasks):
     if task["status"] == "processing":
         return {"task_id": task_id, "status": "processing", "message": "正在处理中..."}
 
-    # 设置动态路径
     pdf_path = task["pdf_path"]
     work_dir = task["work_dir"]
-
-    # 临时覆盖全局 WORK_DIR（供子函数使用）
-    pipeline.WORK_DIR = work_dir
-    pipeline.PDF_PATH = pdf_path
+    pdf_type = task.get("pdf_type", "scan")  # 默认按扫描处理
     os.makedirs(work_dir, exist_ok=True)
-    _clear_cell_registry()
 
-    # 后台运行
-    background_tasks.add_task(_run_pipeline, pdf_path, work_dir, task_id)
+    if pdf_type == "vector":
+        # 矢量管线：设置 scan_pipeline.WORK_DIR 以避免 scan_translate_pipeline 导入时的日志报错
+        scan_pipeline.WORK_DIR = work_dir
+        background_tasks.add_task(_run_vector_pipeline, pdf_path, work_dir, task_id)
+    else:
+        # 扫描管线
+        scan_pipeline.WORK_DIR = work_dir
+        scan_pipeline.PDF_PATH = pdf_path
+        _scan_clear_cell_registry()
+        background_tasks.add_task(_run_scan_pipeline, pdf_path, work_dir, task_id)
 
     return {
         "task_id": task_id,
+        "pdf_type": pdf_type,
         "status": "processing",
-        "message": "处理已启动，请用 /api/status/{task_id} 查看进度",
+        "message": f"{pdf_type} 型管线已启动，请用 /api/status/{task_id} 查看进度",
     }
 
 
@@ -337,11 +501,15 @@ async def get_status(task_id: str):
     result = {
         "task_id": task_id,
         "filename": task.get("filename"),
+        "pdf_type": task.get("pdf_type"),
         "status": task.get("status"),
         "progress": task.get("progress"),
-        "ocr_count": task.get("ocr_count"),
+        "text_count": task.get("text_count", task.get("ocr_count")),
         "translated_count": task.get("translated_count"),
     }
+
+    if task.get("pdf_type") == "vector" and task.get("stats"):
+        result["stats"] = task["stats"]
 
     if task["status"] == "failed":
         result["error"] = task.get("error", "未知错误")
