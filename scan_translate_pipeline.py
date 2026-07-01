@@ -34,9 +34,9 @@ from config import (
     CELL_DETECT_ENGINE,
 )
 
-PDF_PATH = r"/Users/a1/projects/pdf_translate/pdfs/20260523-Rolling Mill Foundation Plan GZL24.7-17.8基础平面图-V2.0_1.pdf"
+PDF_PATH = r"/Users/a1/projects/pdf_translate/pdfs/地脚螺栓预埋铁分布图-Model_1.pdf"
 WORK_DIR = r"/Users/a1/projects/pdf_translate/scan_work"
-OUTPUT_PDF = r"/Users/a1/projects/pdf_translate/pdfs/20260523-Rolling Mill Foundation Plan GZL24.7-17.8基础平面图-V2.0_1_translated.pdf"
+OUTPUT_PDF = r"/Users/a1/projects/pdf_translate/pdfs/地脚螺栓预埋铁分布图-Model_1_translated.pdf"
 
 # ---- 版面渲染控制常量（可由环境变量覆盖）----
 # 近水平判定阈值：合并分类与回填走水平/旋转分支必须用同一阈值，
@@ -444,13 +444,15 @@ Terminology references:
                     success_this_batch += 1
                 else:
                     item["translated"] = item["text"]
+                    logger.warning(f"  LLM 未返回翻译: [{orig_idx}] \"{item['text']}\"")
 
             logger.debug(f"  批次 {batch_num}/{total_batches}: 成功 {success_this_batch}/{len(batch)} 条")
             time.sleep(0.3)
 
         except Exception as e:
-            logger.debug(f"  批次 {batch_num}/{total_batches} 异常: {e}，未翻译项保持原文")
+            logger.warning(f"  批次 {batch_num}/{total_batches} LLM 调用异常: {e}，共 {len(batch)} 条未翻译")
             for orig_idx, item in batch:
+                logger.warning(f"    未翻译: [{orig_idx}] \"{item['text']}\"")
                 if "translated" not in item:
                     item["translated"] = item["text"]
 
