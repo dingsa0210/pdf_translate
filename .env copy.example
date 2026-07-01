@@ -1,0 +1,33 @@
+# ============================================================
+# PDF 翻译项目 - 环境变量配置示例
+# 复制此文件为 .env 并填入实际值
+# ============================================================
+
+# ---- LLM 翻译配置 (OpenAI 兼容接口) ----
+LLM_API_BASE=https://api.siliconflow.cn/v1/
+LLM_API_KEY=sk-your-api-key-here
+LLM_MODEL=tencent/Hunyuan-MT-7B
+LLM_BATCH_SIZE=40
+LLM_TEMPERATURE=0.1
+
+# 翻译引擎: "llm" (OpenAI兼容API) 或 "dictionary" (离线术语库)
+TRANSLATE_ENGINE=llm
+
+# ---- OCR / 渲染参数 ----
+RENDER_DPI=200
+CHUNK_SIZE=4000
+
+# ---- 单元格检测引擎 ----
+# "opencv_v3" = 纯OpenCV多策略检测（推荐，无需GPU）
+# "ppstructure" = PaddleOCR PP-Structure表格识别（需GPU，CPU环境下极慢）
+CELL_DETECT_ENGINE=opencv_v3
+
+# 导入ppstructure时的超时时间（秒）
+PPOCR_IMPORT_TIMEOUT=1800
+
+# ---- 字体路径 ----
+FONT_PATH=C:\Windows\Fonts\arial.ttf
+
+ALL_PROXY=
+HTTP_PROXY=
+HTTPS_PROXY=
