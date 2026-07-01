@@ -56,14 +56,23 @@ CELL_WHITE_THRESHOLD = float(os.environ.get("CELL_WHITE_THRESHOLD", "0.65"))  # 
 
 # ---- loguru 日志配置 ----
 LOG_DIR = os.path.join(WORK_DIR, "logs")
-os.makedirs(LOG_DIR, exist_ok=True)
+try:
+    os.makedirs(LOG_DIR, exist_ok=True)
+except Exception:
+    pass  # 导入时可能 WORK_DIR 不可写，忽略
 from datetime import datetime
 LOG_FILE = os.path.join(LOG_DIR, f"cell_pipeline_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.log")
 
-# 移除默认 handler，添加控制台 + 文件双输出
-logger.remove()
+# 移除默认 handler，添加控制台 + 文件双输出（导入时容错）
+try:
+    logger.remove()
+except Exception:
+    pass
 logger.add(sys.stdout, level="INFO", format="<green>{time:HH:mm:ss}</green> | <level>{level: <8}</level> | <level>{message}</level>")
-logger.add(LOG_FILE, level="DEBUG", format="{time:YYYY-MM-DD HH:mm:ss.SSS} | {level: <8} | {name}:{function}:{line} | {message}", rotation="10 MB", retention="7 days")
+try:
+    logger.add(LOG_FILE, level="DEBUG", format="{time:YYYY-MM-DD HH:mm:ss.SSS} | {level: <8} | {name}:{function}:{line} | {message}", rotation="10 MB", retention="7 days")
+except Exception:
+    pass  # 文件日志不可用时忽略
 
 # ---- 单元格全局注册表 ----
 # cell_registry: {(cl, ct, cr, cb) -> cell_id}
@@ -259,9 +268,9 @@ def _generate_cell_report(report_path: str):
     logger.info(f"  [报告] 单元格映射报告已保存: {report_path}")
 
     # 同时输出到控制台（精简版）
-    print("\n" + "=" * 70)
-    print("  单元格 → OCR文本 映射总览")
-    print("=" * 70)
+    logger.debug("\n" + "=" * 70)
+    logger.debug("  单元格 → OCR文本 映射总览")
+    logger.debug("=" * 70)
     for cid in sorted(_cell_texts.keys(), key=lambda x: int(x.split("_")[1])):
         texts = _cell_texts[cid]
         cell_key = None
@@ -272,11 +281,11 @@ def _generate_cell_report(report_path: str):
         if cell_key:
             cw, ch = cell_key[2] - cell_key[0], cell_key[3] - cell_key[1]
             flag = " ⚠️多文本" if len(texts) > 1 else ""
-            print(f"  {cid} | {cw}×{ch}px | {len(texts)}项{flag}")
+            logger.debug(f"  {cid} | {cw}×{ch}px | {len(texts)}项{flag}")
             for idx, orig, trans in texts:
                 status = "✓" if orig != trans else "✗"
-                print(f"    {status} OCR#{idx}: {orig[:45]} → {trans[:45]}")
-    print("=" * 70)
+                logger.debug(f"    {status} OCR#{idx}: {orig[:45]} → {trans[:45]}")
+    logger.debug("=" * 70)
 
 
 def _clear_cell_registry():
@@ -304,11 +313,11 @@ def translate_with_llm(text_items: list) -> list:
     try:
         from openai import OpenAI
     except ImportError:
-        print("openai 未安装，回退到术语字典翻译")
+        logger.debug("openai 未安装，回退到术语字典翻译")
         return translate_with_dictionary(text_items)
 
     if not LLM_API_BASE or not LLM_API_KEY or not LLM_MODEL:
-        print("LLM API 配置不完整，回退到术语字典翻译")
+        logger.debug("LLM API 配置不完整，回退到术语字典翻译")
         return translate_with_dictionary(text_items)
 
     # 1. 加载翻译缓存
@@ -318,7 +327,7 @@ def translate_with_llm(text_items: list) -> list:
         try:
             with open(cache_path, "r", encoding="utf-8") as f:
                 cache = json.load(f)
-            print(f"  已加载翻译缓存: {len(cache)} 条")
+            logger.debug(f"  已加载翻译缓存: {len(cache)} 条")
         except Exception:
             pass
 
@@ -339,13 +348,13 @@ def translate_with_llm(text_items: list) -> list:
         items_for_llm.append((i, item))
 
     if cache_hits:
-        print(f"  翻译缓存命中: {cache_hits} 条")
+        logger.debug(f"  翻译缓存命中: {cache_hits} 条")
 
     if not items_for_llm:
-        print("  所有文本已在缓存/字典中，跳过 LLM 调用")
+        logger.debug("  所有文本已在缓存/字典中，跳过 LLM 调用")
         return text_items
 
-    print(f"  字典+缓存覆盖 {len(text_items) - len(items_for_llm)} 条, 需 LLM 翻译: {len(items_for_llm)} 条")
+    logger.debug(f"  字典+缓存覆盖 {len(text_items) - len(items_for_llm)} 条, 需 LLM 翻译: {len(items_for_llm)} 条")
 
     client = OpenAI(base_url=LLM_API_BASE, api_key=LLM_API_KEY)
     dict_sample = "\n".join([f'  "{cn}" → "{en}"' for cn, en in list(ENGINEERING_DICT.items())[:20]])
@@ -436,11 +445,11 @@ Terminology references:
                 else:
                     item["translated"] = item["text"]
 
-            print(f"  批次 {batch_num}/{total_batches}: 成功 {success_this_batch}/{len(batch)} 条")
+            logger.debug(f"  批次 {batch_num}/{total_batches}: 成功 {success_this_batch}/{len(batch)} 条")
             time.sleep(0.3)
 
         except Exception as e:
-            print(f"  批次 {batch_num}/{total_batches} 异常: {e}，未翻译项保持原文")
+            logger.debug(f"  批次 {batch_num}/{total_batches} 异常: {e}，未翻译项保持原文")
             for orig_idx, item in batch:
                 if "translated" not in item:
                     item["translated"] = item["text"]
@@ -450,7 +459,7 @@ Terminology references:
         os.makedirs(os.path.dirname(cache_path), exist_ok=True)
         with open(cache_path, "w", encoding="utf-8") as f:
             json.dump(cache, f, ensure_ascii=False, indent=2)
-        print(f"  翻译缓存已更新: +{new_cache_entries} 条 (总计 {len(cache)} 条)")
+        logger.debug(f"  翻译缓存已更新: +{new_cache_entries} 条 (总计 {len(cache)} 条)")
 
     return text_items
 
@@ -472,7 +481,7 @@ def pdf_to_image(pdf_path, dpi=200):
         "pixel_height": int(pix.height),
     }
     doc.close()
-    print(f"  Rendered: {pix.width}x{pix.height} px @ {dpi}DPI")
+    logger.debug(f"  Rendered: {pix.width}x{pix.height} px @ {dpi}DPI")
     return img_path, page_meta
 
 
@@ -1646,7 +1655,7 @@ def merge_ocr_items(items: list, img_bgr=None) -> list:
     if img_bgr is not None:
         img_gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
         h_lines, v_lines, hmask, vmask = _detect_table_lines(img_gray)
-        print(f"  [表格线检测] 局部水平线 {len(h_lines)} 条, 局部竖线 {len(v_lines)} 条")
+        logger.debug(f"  [表格线检测] 局部水平线 {len(h_lines)} 条, 局部竖线 {len(v_lines)} 条")
 
         # === 阶段1: 全图格网检测 (v3.1: 调度引擎 — CELL_DETECT_ENGINE 控制) ===
         all_cells, tbl_h, tbl_v = _detect_all_table_cells_dispatch(
@@ -1904,14 +1913,14 @@ def merge_ocr_items(items: list, img_bgr=None) -> list:
     final_items = merged_text + rotated_items
     if img_bgr is not None:
         final_items = merged_text + rotated_items + merged_cell
-    print(f"  [智能合并] 原始OCR块数量: {len(items)} -> 合并后结构化块数量: {len(final_items)}")
+    logger.debug(f"  [智能合并] 原始OCR块数量: {len(items)} -> 合并后结构化块数量: {len(final_items)}")
 
     return final_items
 
 
 def ocr_with_rapid_chunked(img_path, chunk_size=4000):
     from rapidocr_onnxruntime import RapidOCR
-    print("  Initializing RapidOCR...")
+    logger.debug("  Initializing RapidOCR...")
     engine = RapidOCR()
     
     img = cv2.imread(img_path)
@@ -2526,6 +2535,213 @@ def _render_cell_group(cell_key, items, draw, pil_img, original_bgr, font_path):
     logger.info(f"  [渲染组完成] {cid}: {n}项, 图层{layer_w}x{layer_h}px @({inner_cl},{inner_ct})")
 
 
+def _inpaint_overlay_cell_based(img_path, translated_items, output_img_path):
+    """【对比用】OpenCV单元格边界回填（旧方法）。
+
+    与 v3.0 OCR合并框方法并行运行，产出对比结果用于汇报。
+    差异：
+      - 擦除：单元格整块白底填充（CELL_ERASE_INSET内缩），非单元格bbox外扩3px
+      - 回填：表格项按cell边界分组渲染，非表格项按bbox渲染
+    """
+    img_bgr = cv2.imread(img_path)
+    h, w = img_bgr.shape[:2]
+    original_bgr = img_bgr.copy()
+    img_gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+    h_lines, v_lines, hmask, vmask = _detect_table_lines(img_gray)
+
+    # 收集需要擦除的
+    translated_set = set()
+    for item in translated_items:
+        if item.get("translated", item["text"]) != item["text"]:
+            translated_set.add(id(item))
+
+    # === 擦除：单元格整块 + 非单元格扩展3px ===
+    cell_cnt = fill_cnt = 0
+    cells_erased = set()
+    inset = 2  # 旧方法的2px内缩
+
+    for item in translated_items:
+        x1, y1, x2, y2 = item["bbox"]
+        x1, y1 = max(0, x1), max(0, y1)
+        x2, y2 = min(w - 1, x2), min(h - 1, y2)
+        if x2 <= x1 or y2 <= y1:
+            continue
+
+        cell = item.get("cell")
+        if cell is None and item.get("in_table", False):
+            cell = _find_table_cell(item["bbox"], h_lines, v_lines, hmask, vmask, img_gray)
+
+        if cell is not None:
+            if cell in cells_erased:
+                continue
+            cl, ct, cr, cb = cell
+            ecl = max(0, min(cl + inset, w - 1))
+            ecr = max(0, min(cr - inset, w - 1))
+            ect = max(0, min(ct + inset, h - 1))
+            ecb = max(0, min(cb - inset, h - 1))
+            if ecr > ecl and ecb > ect:
+                cell_region = original_bgr[ect:ecb, ecl:ecr]
+                fill_color = (255, 255, 255) if float(np.mean(cell_region)) > 200 else (240, 240, 240)
+                cv2.rectangle(img_bgr, (ecl, ect), (ecr, ecb), fill_color, -1)
+                cells_erased.add(cell)
+                cell_cnt += 1
+            continue
+
+        if id(item) in translated_set:
+            ex1, ey1 = max(0, x1 - 3), max(0, y1 - 3)
+            ex2, ey2 = min(w - 1, x2 + 3), min(h - 1, y2 + 3)
+            cv2.rectangle(img_bgr, (ex1, ey1), (ex2, ey2), (255, 255, 255), -1)
+            fill_cnt += 1
+
+    logger.info(f"  [Cell方法擦除] 单元格: {cell_cnt}, 普通: {fill_cnt}")
+
+    # === 回填：表格按cell分组，非表格按item独立 ===
+    pil_img = Image.fromarray(cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)).convert("RGBA")
+    draw = ImageDraw.Draw(pil_img)
+    font_path = FONT_PATH if os.path.exists(FONT_PATH) else None
+
+    cell_items_map = {}
+    non_cell_items = []
+    success = skip = 0
+
+    for item in translated_items:
+        translated = item.get("translated", item["text"])
+        if translated == item["text"]:
+            skip += 1
+            continue
+        x1, y1, x2, y2 = item["bbox"]
+        if x2 <= x1 or y2 <= y1:
+            skip += 1
+            continue
+
+        angle = float(item.get("angle", 0.0))
+        if abs(angle) < ANGLE_NEAR_HORIZONTAL and item.get("in_table", False):
+            cell = item.get("cell")
+            if cell is None:
+                cell = _find_table_cell(item["bbox"], h_lines, v_lines, hmask, vmask, img_gray)
+            if cell is not None:
+                cell_items_map.setdefault(cell, []).append(item)
+                continue
+        non_cell_items.append(item)
+
+    # 非表格项渲染（简化版）
+    for item in non_cell_items:
+        translated = item.get("translated", item["text"])
+        x1, y1, x2, y2 = item["bbox"]
+        box_w, box_h = x2 - x1, y2 - y1
+        if box_w <= 0 or box_h <= 0:
+            continue
+        text_color = _sample_text_color(original_bgr, x1, y1, x2, y2)
+        angle = float(item.get("angle", 0.0))
+        if abs(angle) >= ANGLE_NEAR_HORIZONTAL:
+            try:
+                layer, left, top = _render_text_item_layer(item, font_path, text_color)
+                _alpha_composite_at(pil_img, layer, left, top)
+                success += 1
+            except Exception:
+                pass
+            continue
+
+        max_width_edge = max(1, (w - RIGHT_MARGIN) - (x1 + 2))
+        sub_bboxes = item.get("sub_bboxes", [])
+        src_lines = translated.split("\n")
+        if sub_bboxes and len(sub_bboxes) == len(src_lines):
+            for k, ln in enumerate(src_lines):
+                sb = sub_bboxes[k]
+                srow_w = max(1, sb[2] - sb[0])
+                srow_h = max(1, sb[3] - sb[1])
+                fnt, flines, fsp, fth, _ = _fit_text_to_box(
+                    draw, ln, font_path, srow_w, srow_h, max(8, int(srow_h * 0.85)), max_width=max_width_edge)
+                ly = sb[1] + max(0, int((srow_h - fth) / 2))
+                for sub_line in flines:
+                    draw.text((sb[0] + 2, ly), sub_line, fill=text_color + (255,), font=fnt)
+                    sb2 = draw.textbbox((0, 0), sub_line if sub_line else " ", font=fnt)
+                    ly += (sb2[3] - sb2[1]) + fsp
+        else:
+            max_font_size = max(8, int(box_h * 0.85))
+            font, lines, spacing, text_h, _ = _fit_text_to_box(
+                draw, translated, font_path, box_w, box_h, max_font_size, max_width=max_width_edge)
+            ty = y1 + max(0, int((box_h - text_h) / 2)) if len(lines) == 1 else y1 + 2
+            y_cursor = ty
+            for line in lines:
+                draw.text((x1 + 2, y_cursor), line, fill=text_color + (255,), font=font)
+                lb = draw.textbbox((0, 0), line if line else " ", font=font)
+                y_cursor += (lb[3] - lb[1]) + spacing
+        success += 1
+
+    # 表格项按cell分组渲染（旧方法核心差异）
+    for cell_key, items in cell_items_map.items():
+        cl, ct, cr, cb = cell_key
+        inner_cl, inner_ct = cl + inset, ct + inset
+        inner_cr, inner_cb = cr - inset, cb - inset
+        layer_w = max(1, inner_cr - inner_cl)
+        layer_h = max(1, inner_cb - inner_ct)
+
+        items_sorted = sorted(items, key=lambda it: it["bbox"][1])
+        src_lines = [it.get("translated", it["text"]) for it in items_sorted]
+        orig_heights = [it["bbox"][3] - it["bbox"][1] for it in items_sorted]
+        n = len(src_lines)
+        total_orig_h = sum(orig_heights)
+        row_heights = [max(1, layer_h * oh / total_orig_h) for oh in orig_heights] if total_orig_h > 0 else [layer_h / n] * n
+
+        tx = items_sorted[0]["bbox"][0] + 2
+        local_tx = max(0, tx - inner_cl)
+        local_draw_w = max(1, layer_w - local_tx)
+
+        # 统一字号搜索
+        row_fonts = []
+        min_fs, max_fs = 5, max(8, int(min(row_heights) * 0.85))
+        for fs in range(int(max_fs), min_fs - 1, -1):
+            try_font = _load_font(font_path, fs)
+            all_fit = True
+            temp = []
+            for k, ln in enumerate(src_lines):
+                rh = row_heights[k]
+                sp = max(1, int(fs * 0.15))
+                tlines = _wrap_structured_text(draw, ln, try_font, local_draw_w)
+                th = sum(draw.textbbox((0, 0), tl if tl else " ", font=try_font)[3] -
+                         draw.textbbox((0, 0), tl if tl else " ", font=try_font)[1] + sp
+                         for tl in tlines) - sp if tlines else 0
+                if th > rh * 1.05:
+                    all_fit = False
+                    break
+                temp.append((try_font, tlines, sp, th))
+            if all_fit:
+                row_fonts = temp
+                break
+
+        if not row_fonts:
+            for k, ln in enumerate(src_lines):
+                rh = row_heights[k]
+                fnt, flines, fsp, fth, _ = _fit_text_to_box(
+                    draw, ln, font_path, local_draw_w, rh, max(8, int(rh * 0.85)), max_width=local_draw_w)
+                row_fonts.append((fnt, flines, fsp, fth))
+
+        cell_layer = Image.new("RGBA", (layer_w, layer_h), (0, 0, 0, 0))
+        layer_draw = ImageDraw.Draw(cell_layer)
+
+        y_cursor = 0
+        for k, (fnt, flines, fsp, fth) in enumerate(row_fonts):
+            rh = row_heights[k]
+            ly = y_cursor + max(0, int((rh - fth) / 2))
+            it_color = _sample_text_color(original_bgr, *items_sorted[k]["bbox"])
+            for sub_line in flines:
+                sub_w = layer_draw.textbbox((0, 0), sub_line if sub_line else " ", font=fnt)[2] - \
+                        layer_draw.textbbox((0, 0), sub_line if sub_line else " ", font=fnt)[0]
+                lx = local_tx  # 左对齐
+                layer_draw.text((lx, ly), sub_line, fill=it_color + (255,), font=fnt)
+                ly += (layer_draw.textbbox((0, 0), sub_line if sub_line else " ", font=fnt)[3] -
+                       layer_draw.textbbox((0, 0), sub_line if sub_line else " ", font=fnt)[1]) + fsp
+            y_cursor += rh
+
+        pil_img.alpha_composite(cell_layer, dest=(inner_cl, inner_ct))
+        success += 1
+
+    pil_img.convert("RGB").save(output_img_path)
+    logger.info(f"  [Cell方法] 成功: {success}, 跳过: {skip}")
+    return translated_items
+
+
 def image_to_pdf(img_path, output_pdf, dpi=200):
     img = Image.open(img_path)
     img_w, img_h = img.size
@@ -2536,7 +2752,7 @@ def image_to_pdf(img_path, output_pdf, dpi=200):
     page.insert_image(page.rect, filename=img_path, keep_proportion=False)
     doc.save(output_pdf, garbage=4, deflate=True)
     doc.close()
-    print(f"  Output PDF: {output_pdf}")
+    logger.debug(f"  Output PDF: {output_pdf}")
 
 
 def _generate_debug_ocr_pdf(img_path: str, ocr_items: list, debug_pdf_path: str, dpi: int = 200):
@@ -2690,28 +2906,28 @@ def main():
     logger.info(f"日志文件: {LOG_FILE}")
     logger.info("=" * 60)
 
-    print("=" * 60)
-    print("Scan-type PDF CN->EN Translation (v3.0 Multi-Strategy Cell Detection)")
-    print(f"  Log: {LOG_FILE}")
-    print("=" * 60)
+    logger.debug("=" * 60)
+    logger.debug("Scan-type PDF CN->EN Translation (v3.0 Multi-Strategy Cell Detection)")
+    logger.debug(f"  Log: {LOG_FILE}")
+    logger.debug("=" * 60)
     if not os.path.exists(PDF_PATH):
-        print(f"Error: {PDF_PATH} not found")
+        logger.debug(f"Error: {PDF_PATH} not found")
         logger.error(f"PDF not found: {PDF_PATH}")
         return
     os.makedirs(WORK_DIR, exist_ok=True)
 
-    print("\n[Step 1] Render PDF -> Image...")
+    logger.debug("\n[Step 1] Render PDF -> Image...")
     img_path, page_meta = pdf_to_image(PDF_PATH, dpi=RENDER_DPI)
 
-    print("\n[Step 2] RapidOCR (chunked) recognition...")
+    logger.debug("\n[Step 2] RapidOCR (chunked) recognition...")
     raw_ocr_items = ocr_with_rapid_chunked(img_path, chunk_size=CHUNK_SIZE)
     logger.info(f"OCR完成: 识别到 {len(raw_ocr_items)} 个中文文本块")
 
-    print("\n[Step 2.1] Generate OCR Debug PDF (bounding boxes)...")
+    logger.debug("\n[Step 2.1] Generate OCR Debug PDF (bounding boxes)...")
     ocr_debug_pdf = os.path.join(WORK_DIR, "ocr_debug.pdf")
     _generate_debug_ocr_pdf(img_path, raw_ocr_items, ocr_debug_pdf, dpi=page_meta["dpi"])
 
-    print("\n[Step 2.5] Cell-First Intelligent Block Merging...")
+    logger.debug("\n[Step 2.5] Cell-First Intelligent Block Merging...")
     # 传入渲染图像，用于检测表格网格并抑制跨单元格合并（保护表格边框/单元格独立）
     merge_img = cv2.imread(img_path)
     ocr_items = merge_ocr_items(raw_ocr_items, img_bgr=merge_img)
@@ -2720,11 +2936,11 @@ def main():
     with open(ocr_json, "w", encoding="utf-8") as f:
         json.dump(ocr_items, f, ensure_ascii=False, indent=2)
 
-    print("\n[Step 2.6] Generate Merged OCR Debug PDF (post-merge bounding boxes)...")
+    logger.debug("\n[Step 2.6] Generate Merged OCR Debug PDF (post-merge bounding boxes)...")
     ocr_merged_debug_pdf = os.path.join(WORK_DIR, "ocr_debug_merged.pdf")
     _generate_debug_ocr_pdf(img_path, ocr_items, ocr_merged_debug_pdf, dpi=page_meta["dpi"])
 
-    print(f"\n[Step 3] Translate ({TRANSLATE_ENGINE} engine via Custom Tagged Protocol)...")
+    logger.debug(f"\n[Step 3] Translate ({TRANSLATE_ENGINE} engine via Custom Tagged Protocol)...")
     if TRANSLATE_ENGINE == "llm":
         translated_items = translate_with_llm(ocr_items)
     else:
@@ -2734,16 +2950,23 @@ def main():
     with open(trans_json, "w", encoding="utf-8") as f:
         json.dump(translated_items, f, ensure_ascii=False, indent=2)
 
-    print("\n[Step 4] Wipe text regions + strict left-aligned overlay...")
+    logger.debug("\n[Step 4] Wipe text regions + strict left-aligned overlay...")
     output_img = os.path.join(WORK_DIR, "translated_page.png")
     inpaint_and_overlay(img_path, translated_items, output_img)
 
-    print("\n[Step 5] Rebuild PDF...")
+    logger.debug("\n[Step 5] Rebuild PDF (OCR Box Method - Primary)...")
     image_to_pdf(output_img, OUTPUT_PDF, dpi=page_meta["dpi"])
+
+    # === Step 5.1: 生成Cell-Based对比输出（旧方法，用于汇报对比） ===
+    logger.debug("\n[Step 5.1] Generate Cell-Based Comparison Output...")
+    output_cell_img = os.path.join(WORK_DIR, "translated_page_cell_based.png")
+    _inpaint_overlay_cell_based(img_path, translated_items, output_cell_img)
+    output_cell_pdf = OUTPUT_PDF.replace(".pdf", "_cell_based.pdf")
+    image_to_pdf(output_cell_img, output_cell_pdf, dpi=page_meta["dpi"])
 
     # === 生成单元格调试PDF（红框+编号） ===
     debug_pdf = os.path.join(WORK_DIR, "cell_debug.pdf")
-    print("\n[Step 5.5] Generate Cell Debug PDF...")
+    logger.debug("\n[Step 5.5] Generate Cell Debug PDF...")
     _generate_debug_cell_pdf(output_img, debug_pdf, dpi=page_meta["dpi"])
 
     total = len(translated_items)
@@ -2778,16 +3001,18 @@ def main():
     report_path = os.path.join(WORK_DIR, "cell_report.md")
     _generate_cell_report(report_path)
 
-    print(f"\n{'='*60}")
-    print(f"Done!")
-    print(f"  Total Layout blocks: {total}")
-    print(f"  Translated blocks: {translated_count}")
-    print(f"  Registered cells: {_cell_counter[0]}")
-    print(f"  Cell report: {report_path}")
-    print(f"  Cell debug PDF: {debug_pdf}")
-    print(f"  Diagnostic log: {LOG_FILE}")
-    print(f"  Output: {OUTPUT_PDF}")
-    print(f"{'='*60}")
+    logger.debug(f"\n{'='*60}")
+    logger.debug(f"Done!")
+    logger.debug(f"  Total Layout blocks: {total}")
+    logger.debug(f"  Translated blocks: {translated_count}")
+    logger.debug(f"  Registered cells: {_cell_counter[0]}")
+    logger.debug(f"  Output (OCR Box Method):  {OUTPUT_PDF}")
+    logger.debug(f"  Output (Cell-Based Method): {output_cell_pdf}")
+    logger.debug(f"  Cell report: {report_path}")
+    logger.debug(f"  Cell debug PDF: {debug_pdf}")
+    logger.debug(f"  OCR debug PDF: {ocr_merged_debug_pdf}")
+    logger.debug(f"  Diagnostic log: {LOG_FILE}")
+    logger.debug(f"{'='*60}")
 
 
 if __name__ == "__main__":
