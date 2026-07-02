@@ -74,8 +74,11 @@ if not os.path.exists(FONT_PATH):
 PP_IMPORT_TIMEOUT = int(os.environ.get("PP_IMPORT_TIMEOUT", "1800"))
 # 智能分块目标尺寸（像素），子区域超过此尺寸则切分
 TILE_SIZE = int(os.environ.get("TILE_SIZE", "3000"))
-# PP-StructureV3 text_det 边长上限（设大值避免内部再次缩放）
-PP_MAX_SIDE_LEN = int(os.environ.get("PP_MAX_SIDE_LEN", "4000"))
+# PP-StructureV3 text_det 边长上限 —— 不应设过大。
+# 设为 1920 让 PP 内部适度缩放以控制计算量，避免高分辨率不缩放导致性能崩溃。
+PP_MAX_SIDE_LEN = int(os.environ.get("PP_MAX_SIDE_LEN", "1920"))
+# 阶段1粗识别缩略图边长 —— 只需大致定位文本位置，用更小尺寸加速。
+PP_COARSE_SIDE_LEN = int(os.environ.get("PP_COARSE_SIDE_LEN", "1280"))
 
 # ══════════════════════════════════════════════════════════════
 # Step 0: PP-StructureV3 引擎加载
@@ -98,6 +101,8 @@ def _get_pp_structure():
             result["pipeline"] = PPStructureV3(
                 use_doc_orientation_classify=False,
                 use_doc_unwarping=False,
+                use_table_recognition=False,
+                use_formula_recognition=False,
                 text_det_limit_side_len=PP_MAX_SIDE_LEN,
             )
         except Exception as e:
@@ -250,10 +255,14 @@ def _select_best_splits(gaps, total_len, target_region_size):
     """从空档列表中选出最优切割线位置。
 
     贪心策略：从最大空档开始，如果该空档能把某个超限区域切开，就用它。
+    额外约束：切出段长不低于 target_region_size * 0.3，避免产生极窄条带浪费推理资源。
     返回: [split_position, ...] 排序后的切割线位置
     """
     if not gaps:
         return []
+
+    MIN_SEGMENT_RATIO = 0.3  # 切出段长不低于 target_region_size 的 30%
+    min_segment_size = int(target_region_size * MIN_SEGMENT_RATIO)
 
     # 初始状态：整段 [0, total_len) 需要切
     segments = [(0, total_len)]
@@ -263,13 +272,18 @@ def _select_best_splits(gaps, total_len, target_region_size):
         # 在空档中点切
         split_pos = (gap_start + gap_end) // 2
 
-        # 检查这把刀能不能把某个超限段切开
+        # 检查这把刀能不能把某个超限段切开，且切出段不太小
         new_segments = []
         cut_made = False
         for seg_start, seg_end in segments:
             seg_len = seg_end - seg_start
             if seg_len > target_region_size and seg_start < split_pos < seg_end:
-                # 这个段需要切，且刀在这个段内部
+                left_len = split_pos - seg_start
+                right_len = seg_end - split_pos
+                # 防过度切割：切出段必须 >= min_segment_size
+                if left_len < min_segment_size or right_len < min_segment_size:
+                    new_segments.append((seg_start, seg_end))
+                    continue
                 new_segments.append((seg_start, split_pos))
                 new_segments.append((split_pos, seg_end))
                 splits.append(split_pos)
@@ -306,10 +320,10 @@ def _smart_tile_cuts(img_bgr, pipeline):
     img_h, img_w = img_bgr.shape[:2]
 
     # 阶段1：缩略图粗识别
-    scale = min(1.0, PP_MAX_SIDE_LEN / max(img_w, img_h))
+    scale = min(1.0, PP_COARSE_SIDE_LEN / max(img_w, img_h))
     if scale >= 1.0:
         # 原图已足够小，直接全图处理
-        logger.info(f"原图 {img_w}x{img_h} ≤ {PP_MAX_SIDE_LEN}px，无需分块")
+        logger.info(f"原图 {img_w}x{img_h} ≤ {PP_COARSE_SIDE_LEN}px，无需分块")
         return [(0, 0, img_w, img_h)]
 
     small_w, small_h = int(img_w * scale), int(img_h * scale)
