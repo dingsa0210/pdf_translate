@@ -6,3 +6,4 @@ __pycache__/
 *.png
 *.log
 api_tasks/
+.DS_Store
